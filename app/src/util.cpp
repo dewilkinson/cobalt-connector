@@ -4,6 +4,7 @@
 #include <shlobj.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <mutex>
 #include <vector>
@@ -94,7 +95,35 @@ bool fileExists(const std::wstring& path) {
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+bool dirExists(const std::wstring& path) {
+    DWORD a = GetFileAttributesW(path.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 void ensureDir(const std::wstring& path) { SHCreateDirectoryExW(nullptr, path.c_str(), nullptr); }
+
+bool deleteTree(const std::wstring& path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return true;
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        // a file, or a link to a folder: the link itself goes, never what it points at
+        SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (attrs & FILE_ATTRIBUTE_DIRECTORY) return RemoveDirectoryW(path.c_str()) != 0;
+        return DeleteFileW(path.c_str()) != 0;
+    }
+    bool ok = true;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((path + L"\\*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            std::wstring name = fd.cFileName;
+            if (name == L"." || name == L"..") continue;
+            ok = deleteTree(path + L"\\" + name) && ok;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return RemoveDirectoryW(path.c_str()) != 0 && ok;
+}
 
 double fileAgeSeconds(const std::wstring& path) {
     WIN32_FILE_ATTRIBUTE_DATA d{};
@@ -122,21 +151,29 @@ std::wstring exeDir() {
     return slash == std::wstring::npos ? L"." : p.substr(0, slash);
 }
 
+std::wstring localAppDataDir() {
+    PWSTR local = nullptr;
+    std::wstring dir;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) dir = local;
+    if (local) CoTaskMemFree(local);
+    return dir;
+}
+
+static std::wstring homeOverride() {
+    wchar_t buf[MAX_PATH * 2];
+    DWORD n = GetEnvironmentVariableW(L"COBALT_CONNECTOR_HOME", buf, static_cast<DWORD>(std::size(buf)));
+    return n > 0 && n < std::size(buf) ? std::wstring(buf, n) : std::wstring();
+}
+
+bool homeOverridden() { return !homeOverride().empty(); }
+
 std::wstring homeDir() {
     static std::wstring cached;
     if (!cached.empty()) return cached;
-    wchar_t buf[MAX_PATH * 2];
-    DWORD n = GetEnvironmentVariableW(L"COBALT_WORKER_HOME", buf, static_cast<DWORD>(std::size(buf)));
-    if (n > 0 && n < std::size(buf)) {
-        cached = buf;
-    } else {
-        PWSTR local = nullptr;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) {
-            cached = std::wstring(local) + L"\\CobaltWorker";
-            CoTaskMemFree(local);
-        } else {
-            cached = exeDir() + L"\\home";
-        }
+    cached = homeOverride();
+    if (cached.empty()) {
+        std::wstring local = localAppDataDir();
+        cached = local.empty() ? exeDir() + L"\\home" : local + L"\\" + kHomeName;
     }
     ensureDir(cached);
     return cached;
@@ -194,17 +231,13 @@ std::string machineId() {
     std::wstring path = homeFile(L"contributor.json");
     Json cfg = readJsonFile(path);
     std::string id = cfg.str("machine");
-    if (!id.empty()) return id;
-    // the loop's own format: the host name (20 characters at most) and eight hex digits
-    wchar_t host[MAX_COMPUTERNAME_LENGTH + 1] = L"machine";
-    DWORD n = static_cast<DWORD>(std::size(host));
-    GetComputerNameW(host, &n);
-    std::string name = narrow(host).substr(0, 20);
-    unsigned char rnd[4] = {};
+    if (!id.empty()) return id;       // an id made by an older version (the computer's name and 8 hex) is kept
+    // "cc-" and 12 random hex digits: nothing of the computer's name is in it
+    unsigned char rnd[6] = {};
     BCryptGenRandom(nullptr, rnd, sizeof rnd, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
     char hex[16];
-    std::snprintf(hex, sizeof hex, "%02x%02x%02x%02x", rnd[0], rnd[1], rnd[2], rnd[3]);
-    id = name + "-" + hex;
+    std::snprintf(hex, sizeof hex, "%02x%02x%02x%02x%02x%02x", rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5]);
+    id = std::string("cc-") + hex;
     cfg.set("machine", Json::string(id));
     writeJsonFile(path, cfg);
     return id;
@@ -226,6 +259,96 @@ bool setLocalModel(bool on) {
     Json lim = readJsonFile(path);
     lim.set("local_model", Json::boolean(on));
     return writeJsonFile(path, lim);
+}
+
+std::string machineName() { return trim(readJsonFile(homeFile(L"limits.json")).str("name")); }
+
+bool validMachineName(const std::string& name) {
+    if (name.size() > 32) return false;
+    for (unsigned char c : name) {
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ' || c == '-' ||
+                  c == '_' || c == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool setMachineName(const std::string& name) {
+    std::wstring path = homeFile(L"limits.json");
+    Json lim = readJsonFile(path);
+    lim.set("name", Json::string(trim(name)));
+    return writeJsonFile(path, lim);
+}
+
+std::wstring computerName() {
+    wchar_t host[MAX_COMPUTERNAME_LENGTH + 1] = L"";
+    DWORD n = static_cast<DWORD>(std::size(host));
+    if (!GetComputerNameW(host, &n)) return L"this computer";
+    return host;
+}
+
+bool updatesAsk() { return readJsonFile(homeFile(L"limits.json")).str("updates") == "ask"; }
+
+bool setUpdatesAsk(bool ask) {
+    std::wstring path = homeFile(L"limits.json");
+    Json lim = readJsonFile(path);
+    lim.set("updates", Json::string(ask ? "ask" : "auto"));
+    return writeJsonFile(path, lim);
+}
+
+int setLimitsFromFile(const std::wstring& file, std::wstring& message) {
+    std::string text;
+    if (!readFile(file, text, 1u << 16)) {
+        message = L"The limits file could not be read.";
+        return 1;
+    }
+    DeleteFileW(file.c_str());
+    std::wstring path = homeFile(L"limits.json");
+    Json lim = readJsonFile(path);
+    size_t pos = 0;
+    if (text.size() >= 3 && static_cast<unsigned char>(text[0]) == 0xEF) pos = 3;   // a byte order mark
+    int written = 0;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        std::string line = trim(text.substr(pos, end - pos));
+        pos = end + 1;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
+        bool onlyIfMissing = !k.empty() && k[0] == '?';
+        if (onlyIfMissing) k = trim(k.substr(1));
+        if (k.empty() || (onlyIfMissing && lim.get(k))) continue;
+        Json value;
+        if (k == "cores" || k == "memory_gb") {
+            char* stop = nullptr;
+            double d = std::strtod(v.c_str(), &stop);
+            if (v.empty() || *stop != '\0' || d < 1.0) continue;
+            value = Json::number(d);
+        } else if (k == "paused" || k == "local_model") {
+            value = Json::boolean(v == "1" || v == "true" || v == "yes" || v == "on");
+        } else if (k == "name") {
+            if (!validMachineName(v)) continue;            // the computer's own name is shown instead
+            value = Json::string(v);
+        } else if (k == "updates") {
+            value = Json::string(v == "ask" ? "ask" : "auto");
+        } else if (k == "hours") {
+            value = Json::string(v.empty() ? "any" : v);
+        } else if (k == "primed") {
+            value = Json::string(v);
+        } else {
+            continue;                                      // not a setting the app knows
+        }
+        lim.set(k, value);
+        ++written;
+    }
+    if (!writeJsonFile(path, lim)) {
+        message = L"The limits could not be saved.";
+        return 1;
+    }
+    logLine(L"limits set by the installer (" + std::to_wstring(written) + L" settings)");
+    message = L"The limits are saved.";
+    return 0;
 }
 
 std::string anthropicTestUrl() {

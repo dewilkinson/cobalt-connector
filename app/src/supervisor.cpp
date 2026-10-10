@@ -1,12 +1,14 @@
-// The supervised Python worker. The app starts
+// The supervised Python process (the pull loop). The app starts
 //     <install>\python\python.exe -I -X utf8 <install>\bootstrap\cobalt_bootstrap.py --pull
-// in %LOCALAPPDATA%\CobaltWorker with a minimal environment built here - nothing inherited from the user's own
+// in %LOCALAPPDATA%\CobaltConnector with a minimal environment built here - nothing inherited from the user's own
 // environment beyond what Windows itself needs, so no model key or Python setting of theirs leaks in.
-// The partner key and the optional Anthropic key are read from their DPAPI files and passed through
-// the child's environment only. The child and every process it starts (its process pools) run in a
-// job object that is closed with the app, so Quit leaves nothing behind. When the owner chose "Run my model
-// work on this machine" and an Anthropic key is stored, COBALT_LOCAL_MODEL=1 tells the loop to answer their
-// model work here; the key itself goes to Anthropic only. A loop that exits is started
+// The partner key is read from its DPAPI file and passed through the child's environment only. The Anthropic key
+// is read and passed (as ANTHROPIC_API_KEY, with COBALT_LOCAL_MODEL=1) only when the owner chose "Run my model work
+// on this machine" and a key is stored; with that option off the key is not even read, and the child's environment
+// has no ANTHROPIC_API_KEY at all (it is built from scratch below, never inherited). The key itself goes to
+// Anthropic only. The child and every process it starts (its process pools) run in a job object that is closed with
+// the app, so Quit leaves nothing behind. COBALT_APP_VERSION and COBALT_MACHINE_NAME (when the
+// owner chose a name) are sent by the bootstrap in its hello. A loop that exits is started
 // again with backoff: 2 s after a clean exit (the loop stops itself when the fleet moves to new code,
 // and the bootstrap then fetches that build), doubling to 60 s while it keeps failing.
 #include "app.hpp"
@@ -32,7 +34,10 @@ const wchar_t* const kPassThrough[] = {
     L"PROCESSOR_REVISION", L"OS", L"PATHEXT",
 };
 
-std::vector<wchar_t> buildEnvironment(const std::string& partner, const std::optional<std::string>& anthropic) {
+// `anthropic` is set only when the owner chose model work on this machine (Supervisor::start); the check here is the
+// second guard, so the key never reaches the child with the option off.
+std::vector<wchar_t> buildEnvironment(const std::string& partner, const std::optional<std::string>& anthropic,
+                                      bool localModel) {
     std::vector<std::pair<std::wstring, std::wstring>> vars;
     for (const wchar_t* name : kPassThrough) {
         std::wstring v = envVar(name);
@@ -45,10 +50,16 @@ std::vector<wchar_t> buildEnvironment(const std::string& partner, const std::opt
     vars.emplace_back(L"COBALT_CONTRIB_HOME", homeDir());
     vars.emplace_back(L"COBALT_FLEET_URL", widen(relayUrl()));
     vars.emplace_back(L"COBALT_CONTRIB_KEY", widen(partner));
-    if (anthropic) vars.emplace_back(L"ANTHROPIC_API_KEY", widen(*anthropic));
-    if (anthropic && localModelChosen()) vars.emplace_back(L"COBALT_LOCAL_MODEL", L"1");
+    if (anthropic && localModel) {
+        vars.emplace_back(L"ANTHROPIC_API_KEY", widen(*anthropic));
+        vars.emplace_back(L"COBALT_LOCAL_MODEL", L"1");
+    }
     if (std::string test = anthropicTestUrl(); !test.empty()) vars.emplace_back(L"COBALT_ANTHROPIC_URL", widen(test));
     vars.emplace_back(L"NUMBA_CACHE_DIR", homeDir() + L"\\numba");      // numba's compiled cache, out of the install
+    vars.emplace_back(L"COBALT_APP_VERSION", COBALT_CONNECTOR_VERSION_W);
+    // always set, empty when no name is chosen, so clearing the name reaches the server too
+    std::string name = machineName();
+    vars.emplace_back(L"COBALT_MACHINE_NAME", validMachineName(name) ? widen(name) : std::wstring());
     std::sort(vars.begin(), vars.end(), [](const auto& a, const auto& b) {
         return CompareStringOrdinal(a.first.c_str(), -1, b.first.c_str(), -1, TRUE) == CSTR_LESS_THAN;
     });
@@ -98,23 +109,25 @@ double Supervisor::runningSeconds() const {
 
 bool Supervisor::start() {
     if (!fileExists(pythonExe())) {
-        problem_ = L"The embedded Python is missing (" + pythonExe() + L"): reinstall Cobalt Worker.";
+        problem_ = L"The embedded Python is missing (" + pythonExe() + L"): reinstall Cobalt Connector.";
         return false;
     }
     if (!fileExists(bootstrapScript())) {
-        problem_ = L"The bootstrap is missing (" + bootstrapScript() + L"): reinstall Cobalt Worker.";
+        problem_ = L"The bootstrap is missing (" + bootstrapScript() + L"): reinstall Cobalt Connector.";
         return false;
     }
     std::optional<std::string> partner = loadSecret(L"partner");
     if (!partner) {
-        problem_ = L"No partner key is stored. Reinstall Cobalt Worker and enter your partner key.";
+        problem_ = L"No partner key is stored. Run the Cobalt Connector installer again and enter your partner key.";
         return false;
     }
-    std::optional<std::string> anthropic = loadSecret(L"anthropic");
+    // the Anthropic key is read only for model work on this machine: with the option off it stays in its DPAPI file
+    const bool localModel = localModelChosen();
+    std::optional<std::string> anthropic = localModel ? loadSecret(L"anthropic") : std::nullopt;
     machineId();
     problem_.clear();
 
-    std::vector<wchar_t> env = buildEnvironment(*partner, anthropic);
+    std::vector<wchar_t> env = buildEnvironment(*partner, anthropic, localModel);
     SecureZeroMemory(partner->data(), partner->size());
     if (anthropic) SecureZeroMemory(anthropic->data(), anthropic->size());
 
@@ -148,7 +161,7 @@ bool Supervisor::start() {
     if (haveAttrs) DeleteProcThreadAttributeList(attrs);
     if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
     if (!ok) {
-        problem_ = L"The worker could not be started (error " + std::to_wstring(err) + L").";
+        problem_ = L"Cobalt Connector could not start its work process (error " + std::to_wstring(err) + L").";
         logLine(problem_);
         return false;
     }
@@ -158,7 +171,7 @@ bool Supervisor::start() {
     process_ = pi.hProcess;
     startedAt_ = GetTickCount64();
     logLine(L"pull loop started (pid " + std::to_wstring(pi.dwProcessId) + L")" +
-            (anthropic && localModelChosen() ? L", model work on this machine" : L""));
+            (anthropic && localModel ? L", model work on this machine" : L""));
     return true;
 }
 

@@ -1,11 +1,12 @@
 #include <winres.h>
+#include "version.h"
 
 1 ICON "cobalt.ico"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION COBALT_CONNECTOR_VERSION_MAJOR,COBALT_CONNECTOR_VERSION_MINOR,COBALT_CONNECTOR_VERSION_PATCH,0
+ PRODUCTVERSION COBALT_CONNECTOR_VERSION_MAJOR,COBALT_CONNECTOR_VERSION_MINOR,COBALT_CONNECTOR_VERSION_PATCH,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -17,12 +18,12 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "CompanyName", "Cobalt"
-            VALUE "FileDescription", "Cobalt Worker - contributed cores"
-            VALUE "FileVersion", "1.0.0.0"
-            VALUE "InternalName", "CobaltWorker"
-            VALUE "OriginalFilename", "CobaltWorker.exe"
-            VALUE "ProductName", "Cobalt Worker"
-            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "FileDescription", "Cobalt Connector"
+            VALUE "FileVersion", COBALT_CONNECTOR_VERSION_RC
+            VALUE "InternalName", "CobaltConnector"
+            VALUE "OriginalFilename", "CobaltConnector.exe"
+            VALUE "ProductName", "Cobalt Connector"
+            VALUE "ProductVersion", COBALT_CONNECTOR_VERSION_RC
         END
     END
     BLOCK "VarFileInfo"

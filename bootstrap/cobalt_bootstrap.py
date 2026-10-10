@@ -1,6 +1,17 @@
-"""Cobalt Worker bootstrap: fetch the worker code the fleet runs, verify it, and run it.
+# What leaves your machine (full list, from the code: README.md, section "What leaves your machine"):
+# - To the Cobalt server (HTTPS with the default address): your partner key in X-Cobalt-Contributor on every request
+#   (how the machine signs in; the server keeps only its SHA-256), the machine id ("cc-" + 12 random hex), the
+#   computer's name, the name you chose, cores, memory, your limits, versions, job results or error messages, and
+#   model answers with token counts. Other partners see the machine only by its label (the name you chose, or
+#   "<owner>'s machine N"), never the computer's name or the machine id. No request with the key follows a redirect.
+# - To Anthropic, only with model work on: your Anthropic key and your own question's text. Never to Cobalt. With
+#   model work off the work process is never given the key.
+# - To GitHub: a plain download request for an app update. No key, no id.
+# - Never: your files, your environment, your Windows user name, your logs. Market data only comes down.
+#   (A failed job's error text goes back, and a file path in it can include your user folder's name.)
+"""Cobalt Connector bootstrap: fetch the worker code the fleet runs, verify it, and run it.
 
-The installer ships no worker code. CobaltWorker.exe starts this script in the embedded Python:
+The installer ships no worker code. CobaltConnector.exe starts this script in the embedded Python:
 
     python.exe -I -X utf8 <install>\\bootstrap\\cobalt_bootstrap.py --pull
 
@@ -8,12 +19,16 @@ with a minimal environment that carries:
 
     COBALT_FLEET_URL     the fleet server (default https://api.bluesec.ai)
     COBALT_CONTRIB_KEY   the owner's partner key (decrypted from DPAPI by the app, never written to disk)
-    COBALT_CONTRIB_HOME  %LOCALAPPDATA%\\CobaltWorker - settings, limits, status, cache, builds
+    COBALT_CONTRIB_HOME  %LOCALAPPDATA%\\CobaltConnector - settings, limits, status, cache, builds
+    COBALT_APP_VERSION   the app's own version (e.g. 1.2.0), sent in the hello so the server knows it
+    COBALT_MACHINE_NAME  the name the owner chose for this machine ("" = its computer name), sent in the hello
 
 What it does, every time it is started:
 
-1. Says hello to the fleet (POST /api/fleet/hello, the partner key in the X-Cobalt-Contributor header).
-   The answer names the code hash the fleet runs. A refused key stops here: nothing is downloaded.
+1. Says hello to the fleet (POST /api/fleet/hello, the partner key in the X-Cobalt-Contributor header),
+   with the app's version and the machine's chosen name. The answer names the code hash the fleet runs.
+   A refused key stops here: nothing is downloaded. An app the fleet calls too old to take work
+   ("outdated") stops here too: status.json says so, with the fleet's reason, and it asks again later.
 2. If build\\<hash>\\ is not already here and verified, downloads GET /api/fleet/build/<hash>.zip (same
    header), checks that the server labelled it with that hash (X-Cobalt-Code), that no file in it
    points outside its folder, unpacks it into a temporary folder, and recomputes the code hash from
@@ -32,9 +47,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import random
 import re
 import runpy
+import secrets
 import shutil
 import socket
 import subprocess
@@ -46,15 +61,18 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-VERSION = "bootstrap-1"
+VERSION = "bootstrap-2"
 DEFAULT_RELAY = "https://api.bluesec.ai"
 CONTRIB_HEADER = "X-Cobalt-Contributor"
 CODE_HEADER = "X-Cobalt-Code"
 HASH_RE = re.compile(r"^[0-9a-f]{4,40}$")
+APP_VERSION_RE = re.compile(r"^\d{1,6}\.\d{1,6}\.\d{1,6}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{0,32}$")
 LOOP_MODULE = "src.training.contributor"
 MARKER = ".cobalt-build.json"
 STATUS_EVERY_S = 10.0          # the app treats a status older than 30 s as "not reporting"
 REFUSED_WAIT_S = 300.0         # a refused key is asked about again every 5 minutes
+OUTDATED_WAIT_S = 600.0        # an app too old to take work asks again every 10 minutes (it updates meanwhile)
 BUILD_ATTEMPTS = 4
 
 
@@ -70,6 +88,10 @@ class Moved(Exception):
     """The fleet moved to another code hash between hello and download (409)."""
 
 
+class Outdated(Exception):
+    """The fleet sends this app no work until it is updated (hello state "outdated"); the text says why."""
+
+
 def log(text: str) -> None:
     print(time.strftime("%Y-%m-%d %H:%M:%S") + " bootstrap: " + text, flush=True)
 
@@ -78,7 +100,7 @@ def log(text: str) -> None:
 
 
 def home() -> Path:
-    h = os.environ.get("COBALT_CONTRIB_HOME") or os.path.join(os.environ.get("LOCALAPPDATA", "."), "CobaltWorker")
+    h = os.environ.get("COBALT_CONTRIB_HOME") or os.path.join(os.environ.get("LOCALAPPDATA", "."), "CobaltConnector")
     p = Path(h)
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -114,32 +136,33 @@ def write_json(path: Path, obj: dict) -> None:
 
 def machine_id() -> str:
     """The id the app made at install (contributor.json "machine"); made here only if it is missing,
-    in the same form: the host name (20 characters at most) and eight hex digits."""
+    in the same form: "cc-" and 12 random hex digits (nothing of the computer's name). An id made by an
+    older version (the computer's name and eight hex digits) is kept, so the machine keeps its history."""
     path = home() / "contributor.json"
     cfg = read_json(path)
     mid = str(cfg.get("machine") or "")
     if not mid:
-        mid = f"{socket.gethostname()[:20]}-{random.getrandbits(32):08x}"
+        mid = f"cc-{secrets.token_hex(6)}"
         cfg["machine"] = mid
         write_json(path, cfg)
     return mid
 
 
-def write_status(state: str, error: str = "", code: str = "") -> None:
+def write_status(state: str, error: str = "", code: str = "", why: str = "") -> None:
     """status.json in the shape the app reads (the pull loop overwrites it once it runs)."""
     try:
         write_json(home() / "status.json", {
             "state": state, "machine": machine_id(), "relay": relay(), "in_flight": 0, "jobs": [],
-            "last_error": error, "code": code, "version": VERSION, "at": time.time()})
+            "last_error": error, "code": code, "why": why, "version": VERSION, "at": time.time()})
     except OSError:
         pass
 
 
-def wait(seconds: float, state: str, error: str = "", code: str = "") -> None:
+def wait(seconds: float, state: str, error: str = "", code: str = "", why: str = "") -> None:
     """Sleep, keeping status.json fresh so the tray does not say "not reporting"."""
     end = time.monotonic() + seconds
     while True:
-        write_status(state, error, code)
+        write_status(state, error, code, why)
         left = end - time.monotonic()
         if left <= 0:
             return
@@ -149,14 +172,28 @@ def wait(seconds: float, state: str, error: str = "", code: str = "") -> None:
 # ---------------------------------------------------------------- the fleet
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Every request here carries the partner key, and urllib's own redirect handler would resend that header to
+    whatever address a 3xx names. This one follows nothing: the 3xx comes back as an HTTPError, as any other refusal."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# the only opener the fleet's requests use: no redirect is ever followed, so the key goes to COBALT_FLEET_URL alone
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def request(method: str, path: str, body: dict | None = None, timeout: float = 30.0):
+    """A request to the fleet with the partner key. A redirect is never followed (it raises HTTPError with its 3xx
+    code), so the key is sent to the fleet's own address and nowhere else."""
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(relay() + path, data=data, method=method)
     req.add_header(CONTRIB_HEADER, partner_key())
-    req.add_header("User-Agent", "CobaltWorker/" + VERSION)
+    req.add_header("User-Agent", "CobaltConnector/" + VERSION)
     if data is not None:
         req.add_header("Content-Type", "application/json")
-    return urllib.request.urlopen(req, timeout=timeout)
+    return _OPENER.open(req, timeout=timeout)
 
 
 def why(e: urllib.error.HTTPError) -> str:
@@ -167,9 +204,29 @@ def why(e: urllib.error.HTTPError) -> str:
         return str(e.code)
 
 
+def app_version() -> str | None:
+    """The app's version from its environment, when it is a plain N.N.N."""
+    v = (os.environ.get("COBALT_APP_VERSION") or "").strip()
+    return v if APP_VERSION_RE.match(v) else None
+
+
+def machine_name() -> str | None:
+    """The owner's chosen name for this machine: "" clears it (the server then shows the computer's name);
+    None (an app too old to set it, or a name that is not allowed) leaves the server's record alone."""
+    v = os.environ.get("COBALT_MACHINE_NAME")
+    if v is None:
+        return None
+    v = v.strip()
+    return v if NAME_RE.match(v) else None
+
+
 def hello(current: str) -> dict:
     body = {"machine": machine_id(), "host": socket.gethostname(), "cores": os.cpu_count() or 1,
             "code": current, "version": VERSION, "paused": True}
+    if (v := app_version()) is not None:
+        body["app_version"] = v
+    if (n := machine_name()) is not None:
+        body["name"] = n
     try:
         with request("POST", "/api/fleet/hello", body) as r:
             reply = json.loads(r.read().decode("utf-8"))
@@ -179,6 +236,10 @@ def hello(current: str) -> dict:
         raise
     if not isinstance(reply, dict) or not HASH_RE.match(str(reply.get("code") or "")):
         raise ValueError("the fleet's hello answer names no code hash")
+    if reply.get("state") == "outdated":
+        # the fleet gives this machine no work: say so (the app shows "Update needed" and tells the owner)
+        # rather than start a loop that would only sit idle
+        raise Outdated(str(reply.get("why") or "")[:300])
     return reply
 
 
@@ -314,6 +375,11 @@ def prepare() -> Path:
             except Moved as e:
                 log(f"the fleet moved to new code while downloading ({e}); asking again")
                 continue
+        except Outdated as e:
+            log("the fleet says this Cobalt Connector is too old to take work until it is updated; "
+                f"asking again in {OUTDATED_WAIT_S / 60:.0f} minutes")
+            wait(OUTDATED_WAIT_S, "outdated", why=str(e))
+            continue
         except Refused as e:
             log(f"the fleet refused the partner key ({e}); nothing is downloaded")
             wait(REFUSED_WAIT_S, "refused", f"the partner key was refused: {e}")
@@ -342,7 +408,7 @@ def main(argv: list[str]) -> int:
         print(__doc__)
         return 1
     if not partner_key():
-        log("no partner key was given (COBALT_CONTRIB_KEY): start Cobalt Worker from its app")
+        log("no partner key was given (COBALT_CONTRIB_KEY): start Cobalt Connector from its app")
         write_status("refused", "no partner key is stored")
         return 2
     write_status("starting")

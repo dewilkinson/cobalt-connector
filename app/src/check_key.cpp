@@ -1,6 +1,8 @@
 // --check-key: the installer's partner-key check. One POST to the fleet server's /api/fleet/hello
-// with the key in X-Cobalt-Contributor, exactly as the bootstrap and the pull loop say hello. Exit 0: accepted. 1: refused (or not a key at all). 2: could not check (no network, or
-// the server does not answer the fleet route), which the installer offers to continue past offline.
+// with the key in X-Cobalt-Contributor, exactly as the bootstrap and the pull loop say hello (with the app's
+// version and the machine's chosen name, when one is set). Exit 0: accepted. 1: refused (or not a key at
+// all). 2: could not check (no network, or the server does not answer the fleet route), which the installer
+// offers to continue past offline.
 #include "app.hpp"
 
 #include <winhttp.h>
@@ -61,7 +63,7 @@ int checkKey(const std::string& rawKey, const std::string& relay, std::wstring& 
         return 2;
     }
 
-    Handle session(WinHttpOpen(L"CobaltWorker/" COBALT_WORKER_VERSION_W, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    Handle session(WinHttpOpen(L"CobaltConnector/" COBALT_CONNECTOR_VERSION_W, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
     if (!session) {
         message = L"The network could not be opened: " + winError(GetLastError());
@@ -79,12 +81,19 @@ int checkKey(const std::string& rawKey, const std::string& relay, std::wstring& 
         message = L"Could not reach " + widen(relay) + L": " + winError(GetLastError());
         return 2;
     }
+    // the request carries the partner key: never follow a redirect (WinHTTP would resend the header to its address);
+    // a 3xx is answered below as any other status the check does not expect
+    DWORD noRedirects = WINHTTP_DISABLE_REDIRECTS;
+    if (!WinHttpSetOption(req.h, WINHTTP_OPTION_DISABLE_FEATURE, &noRedirects, sizeof noRedirects)) {
+        message = L"The key check could not turn off redirects: " + winError(GetLastError());
+        return 2;                    // the key is never sent on a request that might follow a redirect
+    }
 
-    wchar_t hostName[MAX_COMPUTERNAME_LENGTH + 1] = L"";
-    DWORD hn = static_cast<DWORD>(std::size(hostName));
-    GetComputerNameW(hostName, &hn);
-    std::string body = "{\"machine\":" + jsonEscape(machineId()) + ",\"host\":" + jsonEscape(narrow(hostName)) +
-                       ",\"cores\":" + std::to_string(cpuCount()) + ",\"version\":\"app-check\",\"code\":\"\",\"paused\":true}";
+    std::string name = machineName();
+    std::string body = "{\"machine\":" + jsonEscape(machineId()) + ",\"host\":" + jsonEscape(narrow(computerName())) +
+                       ",\"cores\":" + std::to_string(cpuCount()) + ",\"version\":\"app-check\",\"code\":\"\",\"paused\":true" +
+                       ",\"app_version\":\"" COBALT_CONNECTOR_VERSION "\"" +
+                       ",\"name\":" + jsonEscape(validMachineName(name) ? name : std::string()) + "}";
     std::wstring headers = L"Content-Type: application/json\r\nX-Cobalt-Contributor: " + widen(key) + L"\r\n";
     BOOL sent = WinHttpSendRequest(req.h, headers.c_str(), static_cast<DWORD>(headers.size()), body.data(),
                                    static_cast<DWORD>(body.size()), static_cast<DWORD>(body.size()), 0);

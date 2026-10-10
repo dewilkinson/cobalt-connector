@@ -1,33 +1,69 @@
-COBALT WORKER - LICENCE, WHAT IT RUNS AND WHAT IT HOLDS
+COBALT CONNECTOR - LICENCE, WHAT IT RUNS AND WHAT IT HOLDS
 
-Cobalt Worker lends some of this computer's processor and memory to the training and research jobs
-of a Cobalt fleet. Please read this before you go on.
+Cobalt Connector connects this computer to Cobalt. With your own Anthropic key it answers your own
+Cobalt questions here, and if you choose it lends some of this computer's processor and memory to the
+training and research jobs of a Cobalt fleet. Please read this before you go on.
 
 WHAT IT RUNS
-- A small Windows app (CobaltWorker.exe) with a tray icon. It starts and watches a private copy of
+- A small Windows app (CobaltConnector.exe) with a tray icon. It starts and watches a private copy of
   Python 3.12 that is installed in its own folder - never on your PATH, never your own Python.
 - This installer carries no worker code. Once your partner key is accepted by the Cobalt server, the
   app's bootstrap downloads the worker code the fleet runs, by its version hash, checks that hash, and
-  keeps it in %LOCALAPPDATA%\CobaltWorker\build. When the fleet moves to new code it is fetched again
+  keeps it in %LOCALAPPDATA%\CobaltConnector\build. When the fleet moves to new code it is fetched again
   the same way.
-- The worker PULLS its jobs: it asks the Cobalt server for a job, runs it, and sends the result
-  back. It opens no port on this computer and nothing is forwarded through your router.
+- It PULLS its jobs: it asks the Cobalt server for a job, runs it, and sends the result back. It opens
+  no port on this computer and nothing is forwarded through your router.
 - It works only inside the limits you set on the next pages (cores, memory, hours), at below-normal
   priority, and you can Pause it from the tray at any time.
 
+UPDATES
+- Cobalt Connector keeps itself up to date with the Cobalt server. Every few hours it asks the server
+  which version it wants. A newer version is downloaded only from the Cobalt Connector releases page on
+  GitHub, and run only if its SHA-256 matches what the server said. It then installs itself quietly,
+  keeps your keys and your settings, and starts again.
+- By default it installs updates by itself. You can choose "Ask me first" in its window; it then shows
+  a notification and waits for you, unless the server no longer accepts the version you have.
+
 WHAT IT DOWNLOADS
 - The worker code, as above, and only with an accepted partner key.
-- Public market data only: price bars and the 15-second tape of futures markets. A data file is
-  0.5-1 GB and is downloaded once and kept in %LOCALAPPDATA%\CobaltWorker\cache.
-- Nothing of anyone's accounts, money, trades or keys is ever on the job queue, so none of it can
-  reach this computer.
+- Public market data only: the market-data files the jobs name, from the Cobalt server. A data
+  file is 0.5-1 GB and is downloaded once and kept in %LOCALAPPDATA%\CobaltConnector\cache.
+- New versions of Cobalt Connector itself, as above.
+- A compute job carries nothing of anyone's accounts, money, trades or keys. A model job carries the
+  text of your own question, built by the Cobalt server from what you can already see there.
 
 WHAT IT KEEPS ABOUT YOU
 - Your partner key (required) and, if you choose to give one, your Anthropic API key. Both are
-  stored encrypted for your Windows user only (Windows DPAPI) in %LOCALAPPDATA%\CobaltWorker. The
-  partner key is sent only to the Cobalt server; an Anthropic key is sent only to Anthropic.
-- The Cobalt server sees this computer's name, its number of cores, its memory and your limits, and
-  shows the machine on the fleet page under your first name.
+  stored encrypted for your Windows user only (Windows DPAPI) in %LOCALAPPDATA%\CobaltConnector.
+
+WHAT LEAVES THIS COMPUTER
+(The full list, taken from the code, is in the README, under "What leaves your machine".)
+- To the Cobalt server (over HTTPS with the default address): your partner key, with every request,
+  because that is how this computer signs in (the server keeps only a SHA-256 hash of it and the code
+  never logs it). Also: an
+  id made at install (random; an install from Cobalt Worker keeps its older id, which starts with the
+  computer's name), this computer's name, the name you give it if you choose one, its number of
+  cores, its memory, your limits, the app's version, the names of the market-data files it holds,
+  whether your model work runs here (yes or no, never the key), the results of the jobs it runs,
+  a failed job's error message, and the answers to your own model work with their token counts.
+  Other partners can see the fleet page: it shows the machine under the name you chose (or "<your
+  name>'s machine 1"), the name on your partner key, its cores, memory and hours. Other partners never
+  receive this computer's name or the machine's id; the computer's name is still sent and stored, and
+  only you and the fleet's owner can see it.
+- No request that carries your partner key follows a redirect, so the key goes only to the Cobalt
+  server's address.
+- The Cobalt server keeps the machine's record until your partner key is revoked, and keeps job
+  results, error messages and answers with no set time limit.
+- To Anthropic, only if you turn on "Run my model work on this machine": your Anthropic key and the
+  text of your own questions. Your Anthropic key is never sent to Cobalt. With that option off the
+  worker is never given the key: it stays encrypted on this computer.
+- To GitHub: a plain download request when the app updates itself. No key and no id.
+- Nothing else goes anywhere (if Windows is set to use a proxy, requests go through it). Your files,
+  your environment, your Windows user name and your logs are not sent, though a failed job's error
+  message can name a file path that includes your Windows user folder, or carry Anthropic's reason
+  for refusing a model request.
+- The worker code comes from the Cobalt server and changes over time; this describes it as of this
+  release.
 
 CHECKING
 A share of the jobs this computer finishes is replayed on the fleet owner's own machine and the
@@ -58,5 +94,5 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FO
 DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
 OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-The licence covers Cobalt Worker (the app, its installer and its bootstrap). The worker code it
+The licence covers Cobalt Connector (the app, its installer and its bootstrap). The worker code it
 downloads with a partner key is not part of this software and is not covered by this licence.

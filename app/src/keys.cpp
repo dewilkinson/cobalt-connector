@@ -1,5 +1,5 @@
 // The partner key and the optional Anthropic key, encrypted with DPAPI (CryptProtectData) for the
-// current Windows user, in %LOCALAPPDATA%\CobaltWorker\<name>.key. A key's value is never logged.
+// current Windows user, in %LOCALAPPDATA%\CobaltConnector\<name>.key. A key's value is never logged.
 #include "app.hpp"
 
 #include <dpapi.h>
@@ -10,8 +10,13 @@ namespace cw {
 
 static std::wstring secretPath(const wchar_t* name) { return homeDir() + L"\\" + name + L".key"; }
 
+// Part of how every stored key is sealed, from the app's first version (when it was called Cobalt Worker).
+// It must never change: a key sealed with one value cannot be opened with another, so renaming it would
+// make every partner.key and anthropic.key already on a machine unreadable.
+static constexpr char kLegacyKeyEntropy[] = "CobaltWorker/";
+
 static DATA_BLOB entropyFor(const wchar_t* name, std::string& holder) {
-    holder = "CobaltWorker/" + narrow(name);
+    holder = kLegacyKeyEntropy + narrow(name);
     DATA_BLOB e{};
     e.cbData = static_cast<DWORD>(holder.size());
     e.pbData = reinterpret_cast<BYTE*>(holder.data());
@@ -26,7 +31,7 @@ bool saveSecret(const wchar_t* name, const std::string& value) {
     in.cbData = static_cast<DWORD>(copy.size());
     in.pbData = reinterpret_cast<BYTE*>(copy.data());
     DATA_BLOB out{};
-    BOOL ok = CryptProtectData(&in, L"Cobalt Worker key", &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out);
+    BOOL ok = CryptProtectData(&in, L"Cobalt Connector key", &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out);
     SecureZeroMemory(copy.data(), copy.size());
     if (!ok) return false;
     std::string blob(reinterpret_cast<const char*>(out.pbData), out.cbData);
@@ -60,7 +65,8 @@ bool deleteSecret(const wchar_t* name) {
 
 // The installer writes `partner=...`, `anthropic=...` and optionally `relay=...` into a file in its own
 // temporary folder (so no key is ever on a command line) and calls --set-keys <file>. The file is
-// overwritten and deleted once read. An empty `anthropic=` removes a stored Anthropic key.
+// overwritten and deleted once read. An empty `anthropic=` removes a stored Anthropic key. `partner=` may be
+// left out when a partner key is already stored (a reinstall that only changes the Anthropic key).
 int setKeysFromFile(const std::wstring& file, std::wstring& message) {
     std::string text;
     if (!readFile(file, text, 1u << 16)) {
@@ -89,12 +95,18 @@ int setKeysFromFile(const std::wstring& file, std::wstring& message) {
         else if (k == "relay") relay = v;
     }
     SecureZeroMemory(text.data(), text.size());
+    bool ok = true;
     if (partner.empty()) {
-        message = L"No partner key was given: the app does not run without one.";
-        return 1;
+        std::optional<std::string> stored = loadSecret(L"partner");
+        if (stored) SecureZeroMemory(stored->data(), stored->size());
+        if (!stored) {
+            message = L"No partner key was given: the app does not run without one.";
+            return 1;
+        }
+    } else {
+        ok = saveSecret(L"partner", partner);
+        SecureZeroMemory(partner.data(), partner.size());
     }
-    bool ok = saveSecret(L"partner", partner);
-    SecureZeroMemory(partner.data(), partner.size());
     if (sawAnthropic) {
         ok = (anthropic.empty() ? deleteSecret(L"anthropic") : saveSecret(L"anthropic", anthropic)) && ok;
         SecureZeroMemory(anthropic.data(), anthropic.size());

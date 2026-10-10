@@ -1,6 +1,7 @@
-// The tray icon (idle / working / paused / error) and the small window: the machine's limits, the owner's
-// Anthropic key and the "run my model work on this machine" option, what the pull loop reports in status.json
-// (refreshed every 2 s) and the tail of its log.
+// The tray icon (idle / working / paused / error) and the small window: the machine's limits, its name and how
+// it updates, the owner's Anthropic key and the "run my model work on this machine" option, what the pull loop
+// reports in status.json (refreshed every 2 s) and the tail of its log. Notifications (tray toasts) are sent
+// once per change and at most one of a kind an hour; the window always shows the same state.
 #include "app.hpp"
 
 #include <commctrl.h>
@@ -10,6 +11,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
+#include <memory>
 #include <vector>
 
 namespace cw {
@@ -22,10 +25,20 @@ enum : int {
     IDC_STATUS = 100, IDC_DETAIL, IDC_LIMITS_GROUP, IDC_CORES_LBL, IDC_CORES, IDC_CORES_OF, IDC_MEM_LBL, IDC_MEM,
     IDC_MEM_OF, IDC_HOURS_LBL, IDC_HOURS, IDC_HOURS_HINT, IDC_SAVE, IDC_PAUSE, IDC_LOGON, IDC_JOBS_LBL, IDC_JOBS,
     IDC_LOG_LBL, IDC_LOG, IDC_VIEWLOG, IDC_HIDE, IDC_MODEL_GROUP, IDC_LOCAL, IDC_KEY_STATE, IDC_KEY_EDIT, IDC_KEY_SAVE,
-    IDC_KEY_CLEAR,
+    IDC_KEY_CLEAR, IDC_MACHINE_GROUP, IDC_NAME_LBL, IDC_NAME, IDC_NAME_SAVE, IDC_UPDATES_LBL, IDC_UPDATES,
+    IDC_UPDATE_NOW, IDC_VERSION,
 };
 enum : UINT { CMD_OPEN = 1, CMD_PAUSE, CMD_LOGON, CMD_VIEWLOG, CMD_QUIT };
-enum : UINT_PTR { TIMER_SUPERVISE = 1, TIMER_STATUS = 2 };
+enum : UINT_PTR { TIMER_SUPERVISE = 1, TIMER_STATUS = 2, TIMER_UPDATE = 3, TIMER_QUIT = 4 };
+
+// What a notification is about: at most one of each kind an hour.
+enum class Notice { KeyRefused, Benched, Stopped, Outdated, UpdateReady, UpdateAsk, UpdateRequired, UpdateFailed,
+                    Updated, Count };
+// What a click on the notification does.
+enum class Click { Open, Update, Download };
+
+constexpr time_t kCheckEvery = 6 * 3600;      // the update check, when all is well
+constexpr time_t kFirstCheck = 60;            // after the app starts
 
 struct App {
     HINSTANCE inst = nullptr;
@@ -39,6 +52,17 @@ struct App {
     bool trayAdded = false;
     std::wstring headline, detail, jobsText, logText, tip;
     Supervisor sup;
+    // notifications
+    ULONGLONG lastNotice[static_cast<int>(Notice::Count)] = {};
+    std::string noticeState;          // the status last notified about ("" while all is well)
+    Click balloonClick = Click::Open;
+    std::wstring pendingNotice;       // sent once the tray icon is up (the result of an update, at start)
+    // updates
+    std::wstring updateLine = L"Version " COBALT_CONNECTOR_VERSION_W;
+    UpdateResult available;           // a newer version, when the owner chose to be asked
+    bool haveAvailable = false;
+    bool installing = false;
+    time_t nextUpdateCheck = 0;
 } g;
 
 int S(int v) { return MulDiv(v, static_cast<int>(g.dpi), 96); }
@@ -160,6 +184,28 @@ void trayUpdate(bool add) {
     }
 }
 
+// A tray notification (a toast on Windows 10 and 11). Focus Assist may hold it back: it is a courtesy only.
+void trayNotify(Notice kind, const std::wstring& text, Click click) {
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG& last = g.lastNotice[static_cast<int>(kind)];
+    if (last && now - last < 3600ull * 1000ull) return;
+    if (!g.trayAdded) trayUpdate(true);
+    if (!g.trayAdded) return;
+    last = now;
+    NOTIFYICONDATAW nid{};
+    nid.cbSize = sizeof nid;
+    nid.hWnd = g.wnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_INFO;
+    wcsncpy_s(nid.szInfoTitle, kAppName, _TRUNCATE);
+    wcsncpy_s(nid.szInfo, text.c_str(), _TRUNCATE);
+    nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON | NIIF_RESPECT_QUIET_TIME;
+    nid.hBalloonIcon = g.appIcon;
+    g.balloonClick = click;
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    logLine(L"notification: " + text);
+}
+
 void trayRemove() {
     if (!g.trayAdded) return;
     NOTIFYICONDATAW nid{};
@@ -193,22 +239,29 @@ void readStatus() {
         std::wstring in = next > now ? L" Starting again in " + std::to_wstring((next - now + 999) / 1000) + L" s." : L"";
         if (g.sup.failures() >= 2) {
             state = TrayState::Error;
-            headline = L"The worker stopped";
-            detail = L"It exited unexpectedly; see the log." + in;
+            headline = L"Stopped";
+            detail = L"Its work process exited unexpectedly; see the log." + in;
         } else {
             headline = L"Starting";
-            detail = L"Starting the worker." + in;
+            detail = L"Starting up." + in;
         }
     } else if (!fresh) {
         if (ran > 90.0) {
             state = TrayState::Error;
             headline = L"Not reporting";
-            detail = L"The worker has not reported for a while; see the log below.";
+            detail = L"The work process has not reported for a while; see the log below.";
         } else {
             state = paused ? TrayState::Paused : TrayState::Idle;
             headline = L"Starting";
-            detail = L"Starting the worker (the first start takes a little longer).";
+            detail = L"Starting up (the first start takes a little longer).";
         }
+    } else if (s == "outdated") {
+        state = TrayState::Error;
+        headline = L"Update needed";
+        std::string why = st.str("why");
+        detail = !why.empty() ? widen(why)
+                              : L"This Cobalt Connector is too old to take work. It will update itself, or you can "
+                                L"download the new one from the Cobalt Connector page.";
     } else if (s == "working" || inFlight > 0) {
         state = TrayState::Working;
         headline = L"Working";
@@ -228,7 +281,7 @@ void readStatus() {
     } else if (s == "offline") {
         state = TrayState::Error;
         headline = L"Offline";
-        detail = L"The Cobalt server could not be reached; the worker keeps trying every minute.";
+        detail = L"The Cobalt server could not be reached; it keeps trying every minute.";
     } else if (s == "benched") {
         state = TrayState::Error;
         headline = L"Benched";
@@ -236,13 +289,14 @@ void readStatus() {
     } else if (s == "refused") {
         state = TrayState::Error;
         headline = L"Partner key refused";
-        detail = L"The Cobalt server refused the partner key (it may have been revoked). Reinstall with a live key.";
+        detail = L"The Cobalt server refused the partner key (it may have been revoked). Run the Cobalt Connector "
+                 L"installer again and enter a new key.";
     } else if (s == "starting" || s.empty()) {
         headline = L"Starting";
         detail = L"Saying hello to the Cobalt server.";
     } else if (s == "code") {
         headline = L"Updating";
-        detail = L"Downloading the worker code the fleet runs.";
+        detail = L"Downloading the code the fleet runs.";
     } else {
         headline = L"Waiting for work";
         detail = L"Connected; no job for this machine right now.";
@@ -279,7 +333,11 @@ void readStatus() {
                 fmtNum(today->num("seconds") / 60.0) + L" min of work.\r\n";
     }
     std::string machine = st.str("machine");
-    if (!machine.empty()) jobs += L"This machine: " + widen(machine) + L"    code " + widen(st.str("code")) + L"\r\n";
+    if (!machine.empty()) {
+        std::string name = machineName();
+        jobs += L"This machine: " + (name.empty() ? computerName() : widen(name)) + L"    id " + widen(machine) +
+                L"    code " + widen(st.str("code")) + L"\r\n";
+    }
     std::string err = st.str("last_error");
     if (!err.empty()) jobs += L"Last error: " + widen(err) + L"\r\n";
 
@@ -303,6 +361,33 @@ void readStatus() {
         static const wchar_t* const names[] = {L"idle", L"working", L"paused", L"error"};
         logLine(L"tray: " + std::wstring(names[static_cast<int>(state)]) + L" - " + headline + L": " + detail);
     }
+
+    // a notification when something needs the owner, once per change
+    std::string notice;
+    if (fresh && s == "refused") notice = "refused";
+    else if (fresh && s == "benched") notice = "benched";
+    else if (fresh && s == "outdated") notice = "outdated";
+    else if (!g.sup.running() && g.sup.problem().empty() && g.sup.failures() >= 3) notice = "stopped";
+    if (notice != g.noticeState) {
+        g.noticeState = notice;
+        if (notice == "refused") {
+            trayNotify(Notice::KeyRefused, L"Cobalt did not accept your partner key. Run the Cobalt Connector installer "
+                                           L"again and enter a new key.", Click::Open);
+        } else if (notice == "benched") {
+            std::string why = st.str("bench_why");
+            if (why.empty()) why = st.str("why");
+            trayNotify(Notice::Benched,
+                       why.empty() ? std::wstring(L"Cobalt has stopped sending work to this machine for now. Its owner can see why.")
+                                   : L"Cobalt has stopped sending work to this machine: " + widen(why),
+                       Click::Open);
+        } else if (notice == "outdated") {
+            trayNotify(Notice::Outdated, L"Cobalt has paused work for this machine until it is updated. Click here to "
+                                         L"download the new version.", Click::Download);
+        } else if (notice == "stopped") {
+            trayNotify(Notice::Stopped, L"Cobalt Connector's work process keeps stopping. Open Cobalt Connector to see "
+                                        L"the log.", Click::Open);
+        }
+    }
 }
 
 void showStatus() {
@@ -324,6 +409,8 @@ void showStatus() {
     setText(IDC_KEY_STATE, haveKey ? L"An Anthropic key is stored, encrypted for this Windows user. It is sent only to Anthropic."
                                    : L"No Anthropic key is stored.");
     EnableWindow(ctl(IDC_KEY_CLEAR), haveKey);
+    setText(IDC_VERSION, g.updateLine);
+    EnableWindow(ctl(IDC_UPDATE_NOW), g.haveAvailable && !g.installing && !updateThreadBusy());
 }
 
 void refresh() {
@@ -346,6 +433,8 @@ void loadLimits() {
     setText(IDC_HOURS, widen(hours));
     setText(IDC_CORES_OF, L"of " + std::to_wstring(cpus));
     setText(IDC_MEM_OF, L"of " + fmtNum(mem, 0) + L" GB");
+    setText(IDC_NAME, widen(machineName()));
+    SendMessageW(ctl(IDC_UPDATES), CB_SETCURSEL, updatesAsk() ? 1 : 0, 0);
 }
 
 bool validHours(const std::string& h) {
@@ -380,7 +469,7 @@ void saveLimits() {
     if (writeJsonFile(path, lim)) {
         logLine(L"limits saved: " + std::to_wstring(cores) + L" cores, " + fmtNum(mem, 1) + L" GB, hours " +
                 widen(hours.empty() ? "any" : hours));
-        setText(IDC_DETAIL, L"Saved. The worker uses the new limits on its next pass.");
+        setText(IDC_DETAIL, L"Saved. The new limits apply from the next job.");
     } else {
         MessageBoxW(g.wnd, L"The limits could not be saved.", kAppName, MB_OK | MB_ICONERROR);
     }
@@ -408,9 +497,9 @@ void toggleLocalModel() {
     }
     logLine(on ? L"model work on this machine: on" : L"model work on this machine: off");
     bool haveKey = fileExists(homeFile(L"anthropic.key"));
-    setText(IDC_DETAIL, on ? (haveKey ? L"Your model work now runs here, with your own Anthropic key. Restarting the worker."
+    setText(IDC_DETAIL, on ? (haveKey ? L"Your model work now runs here, with your own Anthropic key. Restarting so it takes effect."
                                       : L"Add your Anthropic key below: your model work runs here once one is stored.")
-                           : L"Your model work no longer runs here. Restarting the worker.");
+                           : L"Your model work no longer runs here. Restarting so it takes effect.");
     g.sup.restart();
 }
 
@@ -439,7 +528,7 @@ void saveAnthropicKey() {
         return;
     }
     logLine(L"Anthropic key changed (DPAPI, this Windows user)");
-    setText(IDC_DETAIL, L"Your Anthropic key is stored. Restarting the worker so it is used.");
+    setText(IDC_DETAIL, L"Your Anthropic key is stored. Restarting so it is used.");
     g.sup.restart();
     showStatus();
 }
@@ -453,9 +542,200 @@ void clearAnthropicKey() {
         return;
     }
     logLine(L"Anthropic key removed");
-    setText(IDC_DETAIL, L"Your Anthropic key is removed. Restarting the worker.");
+    setText(IDC_DETAIL, L"Your Anthropic key is removed. Restarting so it takes effect.");
     g.sup.restart();
     showStatus();
+}
+
+// ---------------------------------------------------------------- the machine's name
+
+void saveName() {
+    std::string name = trim(narrow(getText(IDC_NAME)));
+    if (!validMachineName(name)) {
+        MessageBoxW(g.wnd, L"A machine name can be up to 32 characters: letters, digits, spaces, - _ and . only.",
+                    kAppName, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (name == machineName()) {
+        setText(IDC_DETAIL, L"That name is already saved.");
+        return;
+    }
+    if (!setMachineName(name)) {
+        MessageBoxW(g.wnd, L"The name could not be saved.", kAppName, MB_OK | MB_ICONERROR);
+        return;
+    }
+    logLine(name.empty() ? std::wstring(L"machine name cleared") : L"machine name set to \"" + widen(name) + L"\"");
+    setText(IDC_DETAIL, name.empty() ? std::wstring(L"No name chosen: other partners will see this machine as \"<your name>'s machine N\" (you and the fleet's owner see its computer name). Restarting so Cobalt hears it.")
+                                     : L"Cobalt will show this machine as \"" + widen(name) + L"\". Restarting so Cobalt hears it.");
+    g.sup.restart();
+}
+
+// ---------------------------------------------------------------- updates
+
+std::wstring versionLine(const std::wstring& rest) {
+    return L"Version " COBALT_CONNECTOR_VERSION_W + (rest.empty() ? std::wstring() : L" - " + rest);
+}
+
+// What the owner is told when an update did not install: whether it will be tried again is the truth.
+std::wstring notInstalledText(const std::wstring& ver, bool givenUp) {
+    if (givenUp)
+        return L"The update to " + ver + L" did not install, so Cobalt Connector will try again when a newer version "
+               L"is out. You can also download it from the Cobalt Connector page.";
+    return L"The update to " + ver + L" did not install. Cobalt Connector will try it again in a few hours.";
+}
+
+void quitForUpdate() {
+    if (g.installing) DestroyWindow(g.wnd);
+}
+
+void installNow(const UpdateResult& r) {
+    std::wstring ver = widen(r.offer.latest);
+    g.installing = true;
+    g.sup.stop();
+    std::wstring message;
+    if (!launchInstaller(r, message)) {
+        g.installing = false;
+        logLine(L"update: " + message);
+        Json st = readUpdateState();
+        bool givenUp = strikeRelease(st, r.offer.latest, r.offer.sha256);
+        writeUpdateState(st);
+        g.updateLine = versionLine(ver + L" could not be installed");
+        trayNotify(Notice::UpdateFailed, notInstalledText(ver, givenUp), Click::Open);
+        g.sup.restart();
+        showStatus();
+        return;
+    }
+    logLine(L"update: " + message);
+    g.updateLine = versionLine(L"installing " + ver);
+    showStatus();
+    // the installer asks this app to quit too; this is in case it is quicker than that
+    SetTimer(g.wnd, TIMER_QUIT, 4000, nullptr);
+}
+
+void startDownloadNow() {
+    if (!g.haveAvailable || g.installing) return;
+    if (!startUpdateThread(g.wnd, true, true)) return;
+    g.updateLine = versionLine(L"downloading " + widen(g.available.offer.latest) + L"...");
+    setText(IDC_DETAIL, L"Downloading the new version. It installs itself and starts again when it is ready.");
+    showStatus();
+}
+
+void updateTick() {
+    if (g.installing || updateThreadBusy()) return;
+    time_t now = std::time(nullptr);
+    if (now < g.nextUpdateCheck) return;
+    g.nextUpdateCheck = now + kCheckEvery;            // the result sets the real time
+    startUpdateThread(g.wnd, !updatesAsk(), false);
+}
+
+void onUpdateResult(UpdateResult* raw) {
+    std::unique_ptr<UpdateResult> r(raw);
+    time_t now = std::time(nullptr);
+    Json st = readUpdateState();
+    std::wstring ver = widen(r->offer.latest);
+    if (!r->message.empty()) logLine(L"update: " + r->message);
+    auto fine = [&] {
+        st.set("failures", Json::number(0));
+        g.nextUpdateCheck = now + kCheckEvery;
+        st.set("next_check", Json::number(static_cast<double>(g.nextUpdateCheck)));
+    };
+    switch (r->outcome) {
+    case UpdateOutcome::Failed: {
+        int failures = static_cast<int>(st.num("failures")) + 1;
+        long long delay = std::min<long long>(24ll * 3600, 3600ll << std::min(failures - 1, 5));   // 1 h, 2 h, ... 24 h
+        st.set("failures", Json::number(failures));
+        g.nextUpdateCheck = now + static_cast<time_t>(delay);
+        st.set("next_check", Json::number(static_cast<double>(g.nextUpdateCheck)));
+        g.updateLine = versionLine(L"could not check for updates; trying again later");
+        if (r->forced) setText(IDC_DETAIL, L"The update could not be downloaded. Cobalt Connector will try again later.");
+        break;
+    }
+    case UpdateOutcome::NoInfo:
+        fine();
+        g.updateLine = versionLine(L"");
+        break;
+    case UpdateOutcome::UpToDate:
+        fine();
+        g.haveAvailable = false;
+        g.updateLine = versionLine(L"up to date");
+        break;
+    case UpdateOutcome::Available:
+        fine();
+        g.available = *r;
+        g.haveAvailable = true;
+        g.updateLine = versionLine(ver + L" is available");
+        if (st.str("asked") != r->offer.latest) {
+            st.set("asked", Json::string(r->offer.latest));
+            trayNotify(Notice::UpdateAsk, L"A new version of Cobalt Connector (" + ver + L") is out. Click here to "
+                                          L"install it.", Click::Update);
+        }
+        break;
+    case UpdateOutcome::Skipped:
+        fine();
+        g.haveAvailable = false;
+        g.updateLine = versionLine(ver + L" could not be installed on this machine");
+        if (r->offer.required && now - static_cast<time_t>(st.num("required_notified")) > 24 * 3600) {
+            st.set("required_notified", Json::number(static_cast<double>(now)));
+            trayNotify(Notice::UpdateRequired, L"Cobalt has paused work for this machine until it is updated. Click "
+                                               L"here to download the new version.", Click::Download);
+        }
+        break;
+    case UpdateOutcome::Rejected:
+        fine();
+        g.haveAvailable = false;
+        addBadRelease(st, r->offer.latest, r->offer.sha256);
+        g.updateLine = versionLine(ver + L" did not download correctly");
+        trayNotify(Notice::UpdateFailed, L"The update to " + ver + L" did not download correctly, so it was not "
+                                         L"installed. Cobalt Connector will try again when a newer version is out. "
+                                         L"You can also download it from the Cobalt Connector page.",
+                   Click::Open);
+        break;
+    case UpdateOutcome::Ready:
+        fine();
+        g.haveAvailable = false;
+        writeUpdateState(st);
+        trayNotify(Notice::UpdateReady, L"A new version of Cobalt Connector (" + ver + L") is ready. It will install "
+                                        L"itself now and start again in a minute.", Click::Open);
+        installNow(*r);
+        return;
+    }
+    writeUpdateState(st);
+    showStatus();
+}
+
+void changeUpdates() {
+    bool ask = SendMessageW(ctl(IDC_UPDATES), CB_GETCURSEL, 0, 0) == 1;
+    if (ask == updatesAsk()) return;
+    if (!setUpdatesAsk(ask)) {
+        MessageBoxW(g.wnd, L"The setting could not be saved.", kAppName, MB_OK | MB_ICONERROR);
+        return;
+    }
+    logLine(ask ? L"updates: ask first" : L"updates: install automatically");
+    setText(IDC_DETAIL, ask ? L"Saved. Cobalt Connector will ask you before it installs a new version."
+                            : L"Saved. Cobalt Connector will install new versions by itself.");
+    if (!ask && g.haveAvailable) startDownloadNow();
+}
+
+// At start: did the update this app last ran finish?
+void checkFinishedUpdate() {
+    Json st = readUpdateState();
+    std::string target = st.str("target");
+    if (target.empty()) return;
+    st.set("target", Json::string(""));
+    std::wstring ver = widen(target);
+    if (target == COBALT_CONNECTOR_VERSION) {
+        logLine(L"Updated to " + ver + L".");
+        deleteTree(homeDir() + L"\\updates");
+        st.set("failures", Json::number(0));
+        st.set("strikes", Json::object());
+        g.pendingNotice = L"Cobalt Connector updated itself to version " + ver + L".";
+    } else {
+        // a reboot, a power cut or a file held open mid-install looks the same as a bad release here: counted
+        bool givenUp = strikeRelease(st, target, st.str("sha256"));
+        logLine(L"The update to " + ver + L" did not install" + (givenUp ? L"; it is not tried again." : L"."));
+        g.pendingNotice = notInstalledText(ver, givenUp);
+    }
+    writeUpdateState(st);
 }
 
 void viewLog() {
@@ -516,6 +796,20 @@ void layout() {
     place(IDC_SAVE, bx, gy + S(22), S(110), S(28));
     place(IDC_PAUSE, bx, gy + S(56), S(110), S(28));
     y = gy + S(136);
+
+    // this machine: its name, how it updates, the version
+    int ty = y;
+    place(IDC_MACHINE_GROUP, x, ty, w, S(108));
+    y = ty + S(22);
+    place(IDC_NAME_LBL, lx, y + S(3), lw, lineH); place(IDC_NAME, ex, y, S(200), lineH);
+    place(IDC_NAME_SAVE, bx, y - S(2), S(110), S(28));
+    y += lineH + S(6);
+    place(IDC_UPDATES_LBL, lx, y + S(3), lw, lineH); place(IDC_UPDATES, ex, y, S(200), S(160));
+    place(IDC_UPDATE_NOW, bx, y - S(2), S(110), S(28));
+    y += lineH + S(6);
+    place(IDC_VERSION, lx, y + S(2), std::max(S(60), bx - lx - S(8)), lineH);
+    y = ty + S(116);
+
     place(IDC_LOGON, x, y, w, lineH); y += lineH + S(6);
 
     int my = y;
@@ -530,7 +824,7 @@ void layout() {
     y = my + S(126);
 
     place(IDC_JOBS_LBL, x, y, w, S(18)); y += S(20);
-    place(IDC_JOBS, x, y, w, S(110)); y += S(118);
+    place(IDC_JOBS, x, y, w, S(90)); y += S(98);
     place(IDC_LOG_LBL, x, y, w, S(18)); y += S(20);
     int bottom = H - m - S(28) - S(8);
     place(IDC_LOG, x, y, w, std::max(S(60), bottom - y));
@@ -558,7 +852,21 @@ void createControls() {
     make(L"STATIC", L"e.g. 22:00-07:00; empty = any hour", SS_LEFT, IDC_HOURS_HINT);
     make(L"BUTTON", L"Save limits", BS_PUSHBUTTON | WS_TABSTOP, IDC_SAVE);
     make(L"BUTTON", L"Pause", BS_PUSHBUTTON | WS_TABSTOP, IDC_PAUSE);
-    make(L"BUTTON", L"Start Cobalt Worker when I sign in to Windows", BS_AUTOCHECKBOX | WS_TABSTOP, IDC_LOGON);
+    make(L"BUTTON", L"This machine", BS_GROUPBOX, IDC_MACHINE_GROUP);
+    make(L"STATIC", L"Machine name", SS_LEFT, IDC_NAME_LBL);
+    make(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, IDC_NAME, WS_EX_CLIENTEDGE);
+    make(L"BUTTON", L"Save name", BS_PUSHBUTTON | WS_TABSTOP, IDC_NAME_SAVE);
+    make(L"STATIC", L"Updates", SS_LEFT, IDC_UPDATES_LBL);
+    make(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_UPDATES);
+    make(L"BUTTON", L"Update now", BS_PUSHBUTTON | WS_TABSTOP, IDC_UPDATE_NOW);
+    make(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, IDC_VERSION);
+    SendMessageW(ctl(IDC_NAME), EM_SETLIMITTEXT, 32, 0);
+    Edit_SetCueBannerText(ctl(IDC_NAME), computerName().c_str());
+    SendMessageW(ctl(IDC_UPDATES), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Install automatically"));
+    SendMessageW(ctl(IDC_UPDATES), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Ask me first"));
+    SendMessageW(ctl(IDC_UPDATES), CB_SETCURSEL, updatesAsk() ? 1 : 0, 0);
+    EnableWindow(ctl(IDC_UPDATE_NOW), FALSE);
+    make(L"BUTTON", L"Start Cobalt Connector when I sign in to Windows", BS_AUTOCHECKBOX | WS_TABSTOP, IDC_LOGON);
     make(L"BUTTON", L"Your Anthropic key", BS_GROUPBOX, IDC_MODEL_GROUP);
     make(L"BUTTON", L"Run my model work on this machine (my Anthropic key stays here)", BS_AUTOCHECKBOX | WS_TABSTOP,
          IDC_LOCAL);
@@ -637,12 +945,17 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE: layout(); return 0;
     case WM_GETMINMAXINFO: {
         auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
-        mm->ptMinTrackSize = {S(560), S(690)};
+        mm->ptMinTrackSize = {S(560), S(800)};
         return 0;
     }
     case WM_TIMER:
-        if (wp == TIMER_SUPERVISE) g.sup.tick();
+        if (wp == TIMER_SUPERVISE) { if (!g.installing) g.sup.tick(); }
         else if (wp == TIMER_STATUS) refresh();
+        else if (wp == TIMER_UPDATE) updateTick();
+        else if (wp == TIMER_QUIT) { KillTimer(hwnd, TIMER_QUIT); quitForUpdate(); }
+        return 0;
+    case WM_APP_UPDATE:
+        onUpdateResult(reinterpret_cast<UpdateResult*>(lp));
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wp)) {
@@ -652,6 +965,9 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_LOCAL: if (HIWORD(wp) == BN_CLICKED) toggleLocalModel(); break;
         case IDC_KEY_SAVE: saveAnthropicKey(); break;
         case IDC_KEY_CLEAR: clearAnthropicKey(); break;
+        case IDC_NAME_SAVE: saveName(); break;
+        case IDC_UPDATES: if (HIWORD(wp) == CBN_SELCHANGE) changeUpdates(); break;
+        case IDC_UPDATE_NOW: startDownloadNow(); break;
         case IDC_VIEWLOG: viewLog(); break;
         case IDC_HIDE: case IDCANCEL: ShowWindow(hwnd, SW_HIDE); break;
         default: break;
@@ -661,6 +977,11 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(lp)) {
         case WM_LBUTTONDBLCLK: case NIN_SELECT: case NIN_KEYSELECT: showWindow(); break;
         case WM_CONTEXTMENU: case WM_RBUTTONUP: trayMenu(); break;
+        case NIN_BALLOONUSERCLICK:
+            if (g.balloonClick == Click::Update && g.haveAvailable) startDownloadNow();
+            else if (g.balloonClick == Click::Download) ShellExecuteW(hwnd, L"open", kDownloadPage, nullptr, nullptr, SW_SHOWNORMAL);
+            else showWindow();
+            break;
         default: break;
         }
         return 0;
@@ -674,6 +995,10 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_SUPERVISE);
         KillTimer(hwnd, TIMER_STATUS);
+        KillTimer(hwnd, TIMER_UPDATE);
+        KillTimer(hwnd, TIMER_QUIT);
+        cancelUpdates();
+        for (int i = 0; i < 30 && updateThreadBusy(); ++i) Sleep(100);   // let a download stop cleanly
         trayRemove();
         g.sup.stop();
         logLine(L"app stopped");
@@ -707,16 +1032,31 @@ int runApp(HINSTANCE inst, bool show) {
     RegisterClassExW(&wc);
 
     UINT sysDpi = GetDpiForSystem();
-    int w = MulDiv(640, static_cast<int>(sysDpi), 96), h = MulDiv(810, static_cast<int>(sysDpi), 96);
+    int w = MulDiv(640, static_cast<int>(sysDpi), 96), h = MulDiv(900, static_cast<int>(sysDpi), 96);
+    RECT work{};
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0) && work.bottom - work.top > 200)
+        h = std::min(h, static_cast<int>(work.bottom - work.top));
     HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, kWindowClass, kAppName, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT, w, h, nullptr, nullptr, inst, nullptr);
     if (!hwnd) return 1;
-    logLine(L"app started (version " COBALT_WORKER_VERSION_W L")");
+    logLine(L"app started (version " COBALT_CONNECTOR_VERSION_W L")");
     g.tip = std::wstring(kAppName) + L": starting";
     trayUpdate(true);
+    checkFinishedUpdate();
+    if (!g.pendingNotice.empty()) {
+        trayNotify(Notice::Updated, g.pendingNotice, Click::Open);
+        g.pendingNotice.clear();
+    }
+    {   // the first update check a minute after start; a back-off after failures is kept
+        Json st = readUpdateState();
+        time_t now = std::time(nullptr), next = now + kFirstCheck;
+        if (st.num("failures") > 0) next = std::max(next, static_cast<time_t>(st.num("next_check")));
+        g.nextUpdateCheck = next;
+    }
     g.sup.tick();
     SetTimer(hwnd, TIMER_SUPERVISE, 1000, nullptr);
     SetTimer(hwnd, TIMER_STATUS, 2000, nullptr);
+    SetTimer(hwnd, TIMER_UPDATE, 30000, nullptr);
     refresh();
     if (show) showWindow();
 

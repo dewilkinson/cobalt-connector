@@ -1,8 +1,8 @@
-# Builds Cobalt Worker and its installer.
+# Builds Cobalt Connector and its installer.
 #
 #   powershell -ExecutionPolicy Bypass -File build.ps1 [-Clean] [-SkipInstaller]
 #
-# 1. CobaltWorker.exe: CMake + Ninja + MSVC (Visual Studio 2026, MSVC 14.51), Release, /W4 /WX, static CRT.
+# 1. CobaltConnector.exe: CMake + Ninja + MSVC (Visual Studio 2026, MSVC 14.51), Release, /W4 /WX, static CRT.
 #    When Visual Studio has no Windows SDK installed, the SDK's official NuGet packages
 #    (Microsoft.Windows.SDK.CPP and .x64) are downloaded into .cache\winsdk and used instead - no
 #    administrator rights needed.
@@ -11,7 +11,8 @@
 #    (requirements.txt, public PyPI wheels) installed into it with uv (wheels only).
 # 3. The bootstrap (bootstrap\cobalt_bootstrap.py), staged and checked with the staged Python. The
 #    installer carries NO worker code: the bootstrap downloads it by hash once a partner key is accepted.
-# 4. Inno Setup 6 compiles setup.iss into dist\CobaltWorkerSetup.exe.
+# 4. Inno Setup 6 compiles setup.iss into dist\CobaltConnectorSetup.exe, with the version read from
+#    app\CMakeLists.txt (the only place it is written).
 #
 # Everything it downloads or builds stays under .cache\, build\, stage\ and dist\, all gitignored.
 param(
@@ -80,7 +81,7 @@ if ($LASTEXITCODE) { throw "the build failed" }
 $warnings = @($out | Select-String -Pattern "warning [A-Z]+\d+|: warning" )
 Say "warnings: $($warnings.Count)"
 if ($warnings.Count) { throw "the build has warnings (it must build clean at /W4)" }
-$exe = Join-Path $build "CobaltWorker.exe"
+$exe = Join-Path $build "CobaltConnector.exe"
 
 # ------------------------------------------------------------------ 2. the embedded Python
 $pyZip = Join-Path $cache "python-$PythonVersion-embed-amd64.zip"
@@ -124,16 +125,22 @@ Say "checking the third-party libraries import with the staged Python"
 if ($LASTEXITCODE) { throw "the staged libraries do not import" }
 Get-ChildItem $stage -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
 
-Copy-Item $exe (Join-Path $stage "CobaltWorker.exe") -Force
+Copy-Item $exe (Join-Path $stage "CobaltConnector.exe") -Force
 
 # ------------------------------------------------------------------ 4. the installer
 if ($SkipInstaller) { Say "installer skipped"; exit 0 }
 if (-not (Test-Path $Iscc)) { throw "Inno Setup 6 is not at $Iscc (winget install JRSoftware.InnoSetup)" }
-Say "compiling the installer"
-$isccOut = & $Iscc "/DStageDir=$stage" "/DOutDir=$dist" (Join-Path $here "setup.iss") 2>&1
+$cmakeLists = Get-Content (Join-Path $here "app\CMakeLists.txt") -Raw
+if ($cmakeLists -notmatch "project\(CobaltConnector VERSION (\d+\.\d+\.\d+)") { throw "no version in app\CMakeLists.txt" }
+$version = $Matches[1]
+Say "compiling the installer (version $version)"
+$isccOut = & $Iscc "/DStageDir=$stage" "/DOutDir=$dist" "/DAppVersion=$version" (Join-Path $here "setup.iss") 2>&1
 if ($LASTEXITCODE) { $isccOut | Out-Host; throw "ISCC failed" }
 $isccWarn = @($isccOut | Select-String -Pattern "^Warning")
 $isccWarn | Out-Host
 Say "installer compiler warnings: $($isccWarn.Count)"
-$setup = Get-Item (Join-Path $dist "CobaltWorkerSetup.exe")
+$setup = Get-Item (Join-Path $dist "CobaltConnectorSetup.exe")
 Say ("installer: {0} ({1:N1} MB)" -f $setup.FullName, ($setup.Length / 1MB))
+# the release's SHA-256: it goes into the server's connector_release.json, which the app checks before it
+# runs a downloaded installer
+Say ("SHA-256: {0}" -f (Get-FileHash -Algorithm SHA256 $setup.FullName).Hash.ToLowerInvariant())

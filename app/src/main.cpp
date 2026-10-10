@@ -1,14 +1,27 @@
-// CobaltWorker.exe entry point.
+// What leaves your machine (full list, from the code: README.md, section "What leaves your machine"):
+// - To the Cobalt server (HTTPS with the default address): your partner key in X-Cobalt-Contributor on every request
+//   (how the machine signs in; the server keeps only its SHA-256), the machine id ("cc-" + 12 random hex), the
+//   computer's name, the name you chose, cores, memory, your limits, versions, job results or error messages, and
+//   model answers with token counts. Other partners see the machine only by its label (the name you chose, or
+//   "<owner>'s machine N"), never the computer's name or the machine id. No request with the key follows a redirect.
+// - To Anthropic, only with model work on: your Anthropic key and your own question's text. Never to Cobalt. With
+//   model work off the work process is never given the key.
+// - To GitHub: a plain download request for an app update (update.cpp). No key, no id.
+// - Never: your files, your environment, your Windows user name, your logs. Market data only comes down.
+//   (A failed job's error text goes back, and a file path in it can include your user folder's name.)
 //
-//   CobaltWorker.exe                         the tray app, with its window open
-//   CobaltWorker.exe --background            the tray app only (what "Run at logon" starts)
-//   CobaltWorker.exe --check-key <key> [--relay URL] [--out FILE]
-//   CobaltWorker.exe --check-key-file <file> [--relay URL] [--out FILE]   (the installer: no key on a command line)
+// CobaltConnector.exe entry point.
+//
+//   CobaltConnector.exe                         the tray app, with its window open
+//   CobaltConnector.exe --background            the tray app only (what "Run at logon" starts)
+//   CobaltConnector.exe --check-key <key> [--relay URL] [--out FILE]
+//   CobaltConnector.exe --check-key-file <file> [--relay URL] [--out FILE]   (the installer: no key on a command line)
 //        exit 0: accepted, 1: refused or not a key, 2: could not check (offline, or the server has no fleet route)
-//   CobaltWorker.exe --set-keys <file> [--out FILE]   store partner=/anthropic=/relay= lines with DPAPI
-//   CobaltWorker.exe --run-at-logon on|off
-//   CobaltWorker.exe --quit                   stop a running instance (and the loop it supervises)
-//   CobaltWorker.exe --version
+//   CobaltConnector.exe --set-keys <file> [--out FILE]     store partner=/anthropic=/relay= lines with DPAPI
+//   CobaltConnector.exe --set-limits <file> [--out FILE]   merge key=value lines into limits.json (?key= only if unset)
+//   CobaltConnector.exe --run-at-logon on|off
+//   CobaltConnector.exe --quit                   stop a running instance (and the loop it supervises)
+//   CobaltConnector.exe --version
 #include "app.hpp"
 
 #include <shellapi.h>
@@ -73,19 +86,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     };
     std::wstring outFile = option(L"--out");
 
-    if (has(L"--version")) { say(L"Cobalt Worker " COBALT_WORKER_VERSION_W); return 0; }
+    if (has(L"--version")) { say(L"Cobalt Connector " COBALT_CONNECTOR_VERSION_W); return 0; }
     if (has(L"--help") || has(L"/?")) {
-        say(L"Cobalt Worker " COBALT_WORKER_VERSION_W L"\r\n"
+        say(L"Cobalt Connector " COBALT_CONNECTOR_VERSION_W L"\r\n"
             L"  (no options)            the tray app, window open\r\n"
             L"  --background            the tray app only\r\n"
             L"  --check-key <key>       check a partner key against the Cobalt server (exit 0 ok, 1 refused, 2 offline)\r\n"
             L"  --check-key-file <f>    the same, the key read from a file (deleted after)\r\n"
             L"  --set-keys <file>       store partner=/anthropic=/relay= lines, encrypted for this Windows user\r\n"
+            L"  --set-limits <file>     save key=value lines into your limits (?key= only when not set yet)\r\n"
             L"  --run-at-logon on|off   start at sign-in, or not\r\n"
-            L"  --quit                  stop the running app and its worker");
+            L"  --quit                  stop the running app and its work");
         return 0;
     }
     if (has(L"--check-key") || has(L"--check-key-file")) {
+        cw::copyLegacySettings();          // an upgrade keeps the machine's id
         std::string key;
         if (has(L"--check-key-file")) {
             std::wstring f = option(L"--check-key-file");
@@ -103,8 +118,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         return rc;
     }
     if (has(L"--set-keys")) {
+        cw::copyLegacySettings();
         std::wstring message;
         int rc = cw::setKeysFromFile(option(L"--set-keys"), message);
+        report(message, outFile);
+        return rc;
+    }
+    if (has(L"--set-limits")) {
+        cw::copyLegacySettings();
+        std::wstring message;
+        int rc = cw::setLimitsFromFile(option(L"--set-limits"), message);
         report(message, outFile);
         return rc;
     }
@@ -112,7 +135,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         std::wstring v = option(L"--run-at-logon");
         bool on = v == L"on" || v == L"1" || v == L"true";
         bool ok = cw::setRunAtLogon(on);
-        report(ok ? (on ? L"Cobalt Worker starts at sign-in." : L"Cobalt Worker no longer starts at sign-in.")
+        report(ok ? (on ? L"Cobalt Connector starts at sign-in." : L"Cobalt Connector no longer starts at sign-in.")
                   : L"The sign-in setting could not be changed.", outFile);
         return ok ? 0 : 1;
     }
@@ -125,6 +148,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (mutex) CloseHandle(mutex);
         return 0;
     }
+    cw::migrateLegacyHome();               // the first start after an upgrade from Cobalt Worker
     int rc = cw::runApp(inst, !has(L"--background"));
     if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
     return rc;
