@@ -1,0 +1,355 @@
+"""Cobalt Worker bootstrap: fetch the worker code the fleet runs, verify it, and run it.
+
+The installer ships no worker code. CobaltWorker.exe starts this script in the embedded Python:
+
+    python.exe -I -X utf8 <install>\\bootstrap\\cobalt_bootstrap.py --pull
+
+with a minimal environment that carries:
+
+    COBALT_FLEET_URL     the fleet server (default https://api.bluesec.ai)
+    COBALT_CONTRIB_KEY   the owner's partner key (decrypted from DPAPI by the app, never written to disk)
+    COBALT_CONTRIB_HOME  %LOCALAPPDATA%\\CobaltWorker - settings, limits, status, cache, builds
+
+What it does, every time it is started:
+
+1. Says hello to the fleet (POST /api/fleet/hello, the partner key in the X-Cobalt-Contributor header).
+   The answer names the code hash the fleet runs. A refused key stops here: nothing is downloaded.
+2. If build\\<hash>\\ is not already here and verified, downloads GET /api/fleet/build/<hash>.zip (same
+   header), checks that the server labelled it with that hash (X-Cobalt-Code), that no file in it
+   points outside its folder, unpacks it into a temporary folder, and recomputes the code hash from
+   the unpacked files. Only a build whose hash matches is moved into place; older builds are removed.
+3. Runs that build's pull loop in this process - the equivalent of
+   `python -I -m src.training.contributor --pull` with the build folder as the working directory.
+   When the fleet moves to new code the loop stops itself, the app starts this script again, and the
+   new build is fetched by step 2.
+
+If the fleet cannot be reached and a verified build is already here, the newest one is run (the loop
+waits for the server itself). This script uses the Python standard library only and holds nothing of
+the worker code. It never prints, logs or stores the partner key.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import random
+import re
+import runpy
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from pathlib import Path
+
+VERSION = "bootstrap-1"
+DEFAULT_RELAY = "https://api.bluesec.ai"
+CONTRIB_HEADER = "X-Cobalt-Contributor"
+CODE_HEADER = "X-Cobalt-Code"
+HASH_RE = re.compile(r"^[0-9a-f]{4,40}$")
+LOOP_MODULE = "src.training.contributor"
+MARKER = ".cobalt-build.json"
+STATUS_EVERY_S = 10.0          # the app treats a status older than 30 s as "not reporting"
+REFUSED_WAIT_S = 300.0         # a refused key is asked about again every 5 minutes
+BUILD_ATTEMPTS = 4
+
+
+class Refused(Exception):
+    """The fleet refused the partner key (401 or 403)."""
+
+
+class BadBuild(Exception):
+    """A downloaded build failed its check (wrong label, unsafe paths, or its files hash differently)."""
+
+
+class Moved(Exception):
+    """The fleet moved to another code hash between hello and download (409)."""
+
+
+def log(text: str) -> None:
+    print(time.strftime("%Y-%m-%d %H:%M:%S") + " bootstrap: " + text, flush=True)
+
+
+# ---------------------------------------------------------------- where things live
+
+
+def home() -> Path:
+    h = os.environ.get("COBALT_CONTRIB_HOME") or os.path.join(os.environ.get("LOCALAPPDATA", "."), "CobaltWorker")
+    p = Path(h)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def builds_dir() -> Path:
+    p = home() / "build"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def relay() -> str:
+    return (os.environ.get("COBALT_FLEET_URL") or DEFAULT_RELAY).strip().rstrip("/")
+
+
+def partner_key() -> str:
+    return (os.environ.get("COBALT_CONTRIB_KEY") or "").strip()
+
+
+def read_json(path: Path) -> dict:
+    try:
+        v = json.loads(path.read_text(encoding="utf-8-sig"))
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_json(path: Path, obj: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def machine_id() -> str:
+    """The id the app made at install (contributor.json "machine"); made here only if it is missing,
+    in the same form: the host name (20 characters at most) and eight hex digits."""
+    path = home() / "contributor.json"
+    cfg = read_json(path)
+    mid = str(cfg.get("machine") or "")
+    if not mid:
+        mid = f"{socket.gethostname()[:20]}-{random.getrandbits(32):08x}"
+        cfg["machine"] = mid
+        write_json(path, cfg)
+    return mid
+
+
+def write_status(state: str, error: str = "", code: str = "") -> None:
+    """status.json in the shape the app reads (the pull loop overwrites it once it runs)."""
+    try:
+        write_json(home() / "status.json", {
+            "state": state, "machine": machine_id(), "relay": relay(), "in_flight": 0, "jobs": [],
+            "last_error": error, "code": code, "version": VERSION, "at": time.time()})
+    except OSError:
+        pass
+
+
+def wait(seconds: float, state: str, error: str = "", code: str = "") -> None:
+    """Sleep, keeping status.json fresh so the tray does not say "not reporting"."""
+    end = time.monotonic() + seconds
+    while True:
+        write_status(state, error, code)
+        left = end - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(STATUS_EVERY_S, left))
+
+
+# ---------------------------------------------------------------- the fleet
+
+
+def request(method: str, path: str, body: dict | None = None, timeout: float = 30.0):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(relay() + path, data=data, method=method)
+    req.add_header(CONTRIB_HEADER, partner_key())
+    req.add_header("User-Agent", "CobaltWorker/" + VERSION)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def why(e: urllib.error.HTTPError) -> str:
+    try:
+        detail = json.loads(e.read().decode("utf-8", "replace")).get("detail")
+        return f"{e.code} {detail}" if detail else str(e.code)
+    except Exception:
+        return str(e.code)
+
+
+def hello(current: str) -> dict:
+    body = {"machine": machine_id(), "host": socket.gethostname(), "cores": os.cpu_count() or 1,
+            "code": current, "version": VERSION, "paused": True}
+    try:
+        with request("POST", "/api/fleet/hello", body) as r:
+            reply = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise Refused(why(e)) from None
+        raise
+    if not isinstance(reply, dict) or not HASH_RE.match(str(reply.get("code") or "")):
+        raise ValueError("the fleet's hello answer names no code hash")
+    return reply
+
+
+def download(want: str, dest: Path) -> str:
+    """GET /api/fleet/build/<hash>.zip into dest; returns the zip's SHA-256 (for the record)."""
+    delay = 2.0
+    for attempt in range(1, BUILD_ATTEMPTS + 1):
+        try:
+            with request("GET", f"/api/fleet/build/{want}.zip", timeout=900.0) as r:
+                labelled = (r.headers.get(CODE_HEADER) or "").strip()
+                if labelled and labelled != want:
+                    raise BadBuild(f"the server labelled the build {labelled}, not {want}")
+                h = hashlib.sha256()
+                with open(dest, "wb") as f:
+                    while chunk := r.read(1 << 20):
+                        h.update(chunk)
+                        f.write(chunk)
+                return h.hexdigest()
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise Refused(why(e)) from None
+            if e.code == 409:
+                raise Moved(why(e)) from None
+            if e.code < 500 or attempt == BUILD_ATTEMPTS:
+                raise
+            log(f"the build download failed ({why(e)}); trying again in {delay:.0f} s")
+        except (urllib.error.URLError, OSError) as e:
+            if attempt == BUILD_ATTEMPTS:
+                raise
+            log(f"the build download failed ({e}); trying again in {delay:.0f} s")
+        time.sleep(delay)
+        delay *= 2
+    raise RuntimeError("unreachable")
+
+
+def safe_names(z: zipfile.ZipFile) -> bool:
+    for n in z.namelist():
+        p = n.replace("\\", "/")
+        if p.startswith("/") or ":" in p or any(part == ".." for part in p.split("/")):
+            return False
+    return True
+
+
+def code_hash_of(folder: Path) -> str:
+    """The code hash, computed by the build's own definition from its unpacked files, in a separate
+    process so nothing of the build stays loaded here if it does not match."""
+    probe = ("import sys; sys.path.insert(0, sys.argv[1]); "
+             "from src.training import worker as wk; print(wk.code_hash())")
+    out = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", probe, str(folder)], cwd=str(folder),
+                         capture_output=True, text=True, timeout=600, creationflags=subprocess.CREATE_NO_WINDOW)
+    if out.returncode != 0:
+        raise BadBuild("the build's code hash could not be computed: " + (out.stderr or "").strip()[-400:])
+    return out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
+
+
+def verified(folder: Path, want: str) -> bool:
+    m = read_json(folder / MARKER)
+    return m.get("code") == want and (folder / "src" / "training" / "contributor.py").is_file()
+
+
+def fetch(want: str) -> Path:
+    """build\\<want>\\, downloaded and verified if it is not already here."""
+    base = builds_dir()
+    final = base / want
+    if verified(final, want):
+        return final
+    write_status("code", code=want)
+    log(f"downloading the worker build {want}")
+    work = Path(tempfile.mkdtemp(prefix=f".tmp-{want}-", dir=base))
+    try:
+        zpath = work / "build.zip"
+        sha = download(want, zpath)
+        unpacked = work / "build"
+        try:
+            with zipfile.ZipFile(zpath) as z:
+                if not safe_names(z):
+                    raise BadBuild("the build names files outside its folder: nothing unpacked")
+                z.extractall(unpacked)
+        except zipfile.BadZipFile as e:
+            raise BadBuild(f"the download is not a zip ({e})") from None
+        zpath.unlink()
+        got = code_hash_of(unpacked)
+        if got != want:
+            raise BadBuild(f"the build's files hash to {got or 'nothing'}, not {want}: discarded")
+        write_json(unpacked / MARKER, {"code": want, "zip_sha256": sha, "verified_at": time.time(),
+                                       "relay": relay()})
+        if final.exists():
+            shutil.rmtree(final, ignore_errors=True)
+        os.replace(unpacked, final)
+        log(f"the build {want} is verified and in place")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    for old in base.iterdir():                  # one build is kept: the one the fleet runs
+        if old.is_dir() and old.name != want:
+            shutil.rmtree(old, ignore_errors=True)
+    return final
+
+
+def newest_verified() -> Path | None:
+    best: tuple[float, Path] | None = None
+    for d in builds_dir().iterdir():
+        if d.is_dir() and HASH_RE.match(d.name) and verified(d, d.name):
+            t = float(read_json(d / MARKER).get("verified_at") or 0)
+            if best is None or t > best[0]:
+                best = (t, d)
+    return best[1] if best else None
+
+
+# ---------------------------------------------------------------- running the loop
+
+
+def run_loop(folder: Path, args: list[str]) -> None:
+    """`python -I -m src.training.contributor <args>` with `folder` as the working directory, in this
+    process (the embedded Python's ._pth fixes sys.path, so the build folder is put on it here; its
+    process pools inherit sys.path and the -I flag)."""
+    log(f"starting the pull loop from build {folder.name}")
+    os.chdir(folder)
+    sys.path.insert(0, str(folder))
+    sys.argv = [str(folder / "src" / "training" / "contributor.py"), *args]
+    runpy.run_module(LOOP_MODULE, run_name="__main__", alter_sys=True)
+
+
+def prepare() -> Path:
+    """The verified build to run: what the fleet runs now, or (offline) the newest one already here."""
+    backoff = 5.0
+    while True:
+        have = newest_verified()
+        try:
+            reply = hello(have.name if have else "")
+            want = str(reply["code"])
+            try:
+                return fetch(want)
+            except Moved as e:
+                log(f"the fleet moved to new code while downloading ({e}); asking again")
+                continue
+        except Refused as e:
+            log(f"the fleet refused the partner key ({e}); nothing is downloaded")
+            wait(REFUSED_WAIT_S, "refused", f"the partner key was refused: {e}")
+            continue
+        except BadBuild as e:
+            log(f"the downloaded build failed its check and was discarded ({e})")
+            if have is not None:
+                log(f"running the verified build already here, {have.name}")
+                return have
+            wait(backoff, "offline", f"the downloaded worker build failed its check: {e}")
+            backoff = min(60.0, backoff * 2)
+        except Exception as e:
+            if have is not None:
+                log(f"the fleet could not be reached ({e}); running the build already here, {have.name}")
+                return have
+            log(f"the fleet could not be reached and no build is here yet ({e}); trying again in {backoff:.0f} s")
+            wait(backoff, "offline", f"the Cobalt server could not be reached: {e}")
+            backoff = min(60.0, backoff * 2)
+
+
+def main(argv: list[str]) -> int:
+    if "--version" in argv:
+        print(VERSION)
+        return 0
+    if "--pull" not in argv:
+        print(__doc__)
+        return 1
+    if not partner_key():
+        log("no partner key was given (COBALT_CONTRIB_KEY): start Cobalt Worker from its app")
+        write_status("refused", "no partner key is stored")
+        return 2
+    write_status("starting")
+    folder = prepare()
+    run_loop(folder, ["--pull"])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

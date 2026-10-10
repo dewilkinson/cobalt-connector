@@ -1,0 +1,16 @@
+# The third-party libraries the downloaded worker code needs, installed into the embedded Python by
+# build.ps1 (wheels only). All are public packages from PyPI. Pinned to the versions the fleet's own
+# machines run, so a contributed job is computed by the same libraries and the cross-check holds.
+httpx==0.28.1
+fastapi==0.115.11
+pydantic==2.10.6
+numpy==2.2.6
+pandas==3.0.2
+pyarrow==25.0.1
+pytz==2025.1
+tzdata==2025.1
+python-dateutil==2.9.0.post0
+python-dotenv==1.0.1
+scipy==1.17.1
+numba==0.61.2
+smartmoneyconcepts==0.0.27

@@ -1,0 +1,8 @@
+# build outputs and downloads (build.ps1): never committed
+.cache/
+build/
+stage/
+dist/
+__pycache__/
+*.pyc
+.env
