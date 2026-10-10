@@ -1,9 +1,13 @@
 # Cobalt Worker
 
-Cobalt Worker lends a Windows machine's spare processor cores to the **Cobalt training fleet** of a
-partner who holds a **partner key**. It is a small native Windows app with a tray icon: it runs the
-fleet's jobs inside the limits you set (cores, memory, hours), at below-normal priority, and you can
-pause it at any time.
+Cobalt Worker lets a **Cobalt partner** use Cobalt with **their own Anthropic API key, safely**. Your research
+questions, note replies and Ask about Cobalt questions are answered on your own machine, on your own key. **The key
+never leaves your computer**: it is stored encrypted for your Windows user and sent only to Anthropic. Only the answers
+and their token counts go back to Cobalt.
+
+**Optional: contribute cores.** The app can also lend your machine's spare processor cores to the **Cobalt training
+fleet**. It runs the fleet's jobs inside the limits you set (cores, memory, hours), at below-normal priority, and you can
+pause it at any time from the tray icon.
 
 A partner key is required. Without one the installer will not finish and the app will not run. Keys
 are issued by whoever runs the fleet you are joining.

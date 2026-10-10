@@ -48,7 +48,7 @@ Source: "{#StageDir}\python\*"; DestDir: "{app}\python"; Flags: ignoreversion re
 Source: "{#StageDir}\bootstrap\*"; DestDir: "{app}\bootstrap"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{userprograms}\Cobalt Worker"; Filename: "{app}\{#AppExe}"; Comment: "Lend this computer's cores to Cobalt"
+Name: "{userprograms}\Cobalt Worker"; Filename: "{app}\{#AppExe}"; Comment: "Use Cobalt with your own Anthropic key, and optionally lend it spare cores"
 
 [UninstallDelete]
 ; what the app made after install: Python's caches (the downloaded worker build lives under
