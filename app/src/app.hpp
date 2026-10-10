@@ -62,6 +62,13 @@ std::string relayUrl();            // contributor.json "relay", else the hosted 
 std::string machineId();           // contributor.json "machine", made once (the loop's own format)
 bool limitsPaused();
 bool setPaused(bool paused);
+// "Run my model work on this machine": limits.json "local_model". The loop is told through its environment
+// (COBALT_LOCAL_MODEL), so the app restarts the loop when it changes.
+bool localModelChosen();
+bool setLocalModel(bool on);
+// A stand-in for Anthropic's API on this machine, for a smoke test only: contributor.json "anthropic_url",
+// accepted only when it is http://127.0.0.1:<port> or http://localhost:<port>; "" otherwise.
+std::string anthropicTestUrl();
 int cpuCount();
 double totalMemoryGB();
 
@@ -85,6 +92,7 @@ public:
     ~Supervisor();
     void tick();                       // every second, from the UI timer: start, reap, restart with backoff
     void stop();                       // the app is quitting: stop the loop and every process it started
+    void restart();                    // a key or the model-work option changed: stop, and start again at once
     bool running() const { return process_ != nullptr; }
     double runningSeconds() const;
     std::wstring problem() const { return problem_; }   // why it cannot run, or "" when it can

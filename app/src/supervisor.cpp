@@ -4,7 +4,9 @@
 // environment beyond what Windows itself needs, so no model key or Python setting of theirs leaks in.
 // The partner key and the optional Anthropic key are read from their DPAPI files and passed through
 // the child's environment only. The child and every process it starts (its process pools) run in a
-// job object that is closed with the app, so Quit leaves nothing behind. A loop that exits is started
+// job object that is closed with the app, so Quit leaves nothing behind. When the owner chose "Run my model
+// work on this machine" and an Anthropic key is stored, COBALT_LOCAL_MODEL=1 tells the loop to answer their
+// model work here; the key itself goes to Anthropic only. A loop that exits is started
 // again with backoff: 2 s after a clean exit (the loop stops itself when the fleet moves to new code,
 // and the bootstrap then fetches that build), doubling to 60 s while it keeps failing.
 #include "app.hpp"
@@ -44,6 +46,8 @@ std::vector<wchar_t> buildEnvironment(const std::string& partner, const std::opt
     vars.emplace_back(L"COBALT_FLEET_URL", widen(relayUrl()));
     vars.emplace_back(L"COBALT_CONTRIB_KEY", widen(partner));
     if (anthropic) vars.emplace_back(L"ANTHROPIC_API_KEY", widen(*anthropic));
+    if (anthropic && localModelChosen()) vars.emplace_back(L"COBALT_LOCAL_MODEL", L"1");
+    if (std::string test = anthropicTestUrl(); !test.empty()) vars.emplace_back(L"COBALT_ANTHROPIC_URL", widen(test));
     vars.emplace_back(L"NUMBA_CACHE_DIR", homeDir() + L"\\numba");      // numba's compiled cache, out of the install
     std::sort(vars.begin(), vars.end(), [](const auto& a, const auto& b) {
         return CompareStringOrdinal(a.first.c_str(), -1, b.first.c_str(), -1, TRUE) == CSTR_LESS_THAN;
@@ -153,7 +157,8 @@ bool Supervisor::start() {
     CloseHandle(pi.hThread);
     process_ = pi.hProcess;
     startedAt_ = GetTickCount64();
-    logLine(L"pull loop started (pid " + std::to_wstring(pi.dwProcessId) + L")");
+    logLine(L"pull loop started (pid " + std::to_wstring(pi.dwProcessId) + L")" +
+            (anthropic && localModelChosen() ? L", model work on this machine" : L""));
     return true;
 }
 
@@ -185,6 +190,13 @@ void Supervisor::tick() {
         ++failures_;
         nextStart_ = now + 30000;                     // a missing key or file: look again, quietly
     }
+}
+
+void Supervisor::restart() {
+    stop();
+    failures_ = 0;
+    nextStart_ = 0;
+    tick();
 }
 
 void Supervisor::stop() {

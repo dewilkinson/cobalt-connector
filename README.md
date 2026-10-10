@@ -70,6 +70,8 @@ CobaltWorker.exe (tray app)
        2. GET  /api/fleet/build/<hash>.zip  only if that build is not already here and verified
        3. checks it, unpacks it to %LOCALAPPDATA%\CobaltWorker\build\<hash>\
        4. runs the build's pull loop: asks for a job, runs it, posts the result back
+          (with "Run my model work on this machine": also your model jobs, answered with your key
+           by POST https://api.anthropic.com/v1/messages - the answer text and token counts go back)
 ```
 
 - **The app** (`app/`, C++20, Win32, WinHTTP, no runtime to install) supervises one Python process. It
@@ -102,8 +104,28 @@ CobaltWorker.exe (tray app)
 | amber (bars) | paused by you, or outside your hours |
 | red (!) | a problem: no key, key refused, offline, benched, or the worker keeps stopping |
 
-The window shows your limits (editable), the jobs in flight, today's totals and the log, with Pause /
-Resume and "Run at logon".
+The window shows your limits (editable), your Anthropic key, the jobs in flight, today's totals and the log,
+with Pause / Resume and "Run at logon".
+
+### Your model work on your own machine
+
+In the window, under **Your Anthropic key**:
+
+- **Run my model work on this machine (my Anthropic key stays here)**. When it is on and a key is stored, the
+  worker tells the Cobalt server so when it signs in (a yes/no flag, never the key). From then on your research
+  questions, note replies, Dreamer questions and Ask about Cobalt questions come to this machine as text. The
+  worker calls Anthropic's API with your key, and only the answer text and its token counts go back. A question
+  is one call; a research topic is a short series of calls (a few turns at most, no tools, no files, nothing on
+  the network but Anthropic). While your computer is off the questions wait on the server; after 24 hours an
+  unanswered one is closed with a plain message.
+- **Save key / Clear key** change or remove the stored key. Paste a new key into the box and press **Save key**;
+  the box is emptied at once and the key is stored encrypted, as at install. Changing the key or the option
+  restarts the worker so it takes effect.
+- Pause and your hours limit only the cores you lend: your own model work still runs while you are paused.
+- The jobs box shows **Answering a question...** (or **Researching a topic...**) while it works, and today's
+  model work: answers, tokens in and tokens out. Everything it spends is billed to your Anthropic account.
+- If Anthropic refuses the key, the worker stops asking for model work and the window says so; save a new key
+  to start again.
 
 ## What it downloads and stores
 
@@ -122,7 +144,7 @@ shows the machine on its fleet page under your first name.
 | `%LOCALAPPDATA%\Programs\Cobalt Worker\CobaltWorker.exe` | the app |
 | `...\python\` | a private Python 3.12 (python.org's embeddable build) and the worker's third-party libraries (`requirements.txt`, public PyPI packages) - never on PATH |
 | `...\bootstrap\cobalt_bootstrap.py` | the bootstrap |
-| `%LOCALAPPDATA%\CobaltWorker\` | `limits.json`, `contributor.json` (the machine's id and the server address), `partner.key` and `anthropic.key` (DPAPI-encrypted), `status.json`, `build\<hash>\` (the downloaded worker code), `cache\` (market data), `logs\` |
+| `%LOCALAPPDATA%\CobaltWorker\` | `limits.json` (your limits, Pause, and `local_model`: the model-work option), `contributor.json` (the machine's id and the server address), `partner.key` and `anthropic.key` (DPAPI-encrypted), `status.json`, `build\<hash>\` (the downloaded worker code), `cache\` (market data), `logs\` |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\CobaltWorker` | only when "Run at logon" is on |
 
 ## Your keys
@@ -132,7 +154,8 @@ shows the machine on its fleet page under your first name.
   Windows user on the same machine, or a copy of the files on another machine, cannot decrypt them.
 - The installer hands keys to the app through files in its own temporary folder, which are overwritten
   and deleted once read; no key is put on a command line unless you choose the `/PARTNERKEY=` form.
-- No key is ever written to a log.
+- No key is ever written to a log, and neither is the text of a question or an answer.
+- The window's **Save key** and **Clear key** change or remove the Anthropic key later; it is stored the same way.
 - The partner key is sent only to the fleet server; an Anthropic key is sent only to Anthropic.
 - The fleet's owner can revoke a partner key at any time, which ends the machine's access at once.
 

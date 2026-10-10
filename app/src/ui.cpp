@@ -1,5 +1,6 @@
-// The tray icon (idle / working / paused / error) and the small window: the machine's limits, what the
-// pull loop reports in status.json (refreshed every 2 s) and the tail of its log.
+// The tray icon (idle / working / paused / error) and the small window: the machine's limits, the owner's
+// Anthropic key and the "run my model work on this machine" option, what the pull loop reports in status.json
+// (refreshed every 2 s) and the tail of its log.
 #include "app.hpp"
 
 #include <commctrl.h>
@@ -20,7 +21,8 @@ enum class TrayState { Idle, Working, Paused, Error };
 enum : int {
     IDC_STATUS = 100, IDC_DETAIL, IDC_LIMITS_GROUP, IDC_CORES_LBL, IDC_CORES, IDC_CORES_OF, IDC_MEM_LBL, IDC_MEM,
     IDC_MEM_OF, IDC_HOURS_LBL, IDC_HOURS, IDC_HOURS_HINT, IDC_SAVE, IDC_PAUSE, IDC_LOGON, IDC_JOBS_LBL, IDC_JOBS,
-    IDC_LOG_LBL, IDC_LOG, IDC_VIEWLOG, IDC_HIDE,
+    IDC_LOG_LBL, IDC_LOG, IDC_VIEWLOG, IDC_HIDE, IDC_MODEL_GROUP, IDC_LOCAL, IDC_KEY_STATE, IDC_KEY_EDIT, IDC_KEY_SAVE,
+    IDC_KEY_CLEAR,
 };
 enum : UINT { CMD_OPEN = 1, CMD_PAUSE, CMD_LOGON, CMD_VIEWLOG, CMD_QUIT };
 enum : UINT_PTR { TIMER_SUPERVISE = 1, TIMER_STATUS = 2 };
@@ -210,12 +212,15 @@ void readStatus() {
     } else if (s == "working" || inFlight > 0) {
         state = TrayState::Working;
         headline = L"Working";
-        detail = std::to_wstring(inFlight) + (inFlight == 1 ? L" job" : L" jobs") + L" in flight.";
-        if (paused) detail += L" Paused: no new job is taken; these finish first.";
+        std::string answering = st.get("model") ? st.get("model")->str("now") : std::string();
+        detail = !answering.empty() ? widen(answering)
+                                    : std::to_wstring(inFlight) + (inFlight == 1 ? L" job" : L" jobs") + L" in flight.";
+        if (paused) detail += L" Paused: no new compute job is taken; these finish first.";
     } else if (paused || s == "paused") {
         state = TrayState::Paused;
         headline = L"Paused";
-        detail = L"No new job is taken until you resume.";
+        detail = localModelChosen() ? L"No compute job is taken until you resume; your own model work still runs."
+                                    : L"No new job is taken until you resume.";
     } else if (s == "away") {
         state = TrayState::Paused;
         headline = L"Outside your hours";
@@ -253,7 +258,22 @@ void readStatus() {
             jobs += L"    " + fmtNum(j.num("elapsed")) + L" s\r\n";
         }
     }
+    const Json* model = fresh ? st.get("model") : nullptr;
+    std::string answering = model ? model->str("now") : std::string();
+    if (!answering.empty()) jobs = widen(answering) + L"\r\n" + jobs;
     if (jobs.empty()) jobs = L"No job in flight.\r\n";
+    // the owner's model work, answered here with their own key
+    if (model && model->flag("chosen")) {
+        const Json* mt = model->get("today");
+        double answers = mt ? mt->num("answers") : 0.0, failedM = mt ? mt->num("failed") : 0.0;
+        jobs += L"\r\nModel work today: " + fmtNum(answers) + (answers == 1.0 ? L" answer, " : L" answers, ") +
+                fmtNum(mt ? mt->num("tokens_in") : 0.0) + L" tokens in, " + fmtNum(mt ? mt->num("tokens_out") : 0.0) +
+                L" tokens out" + (failedM > 0 ? L", " + fmtNum(failedM) + L" failed." : std::wstring(L".")) + L"\r\n";
+        if (!model->flag("key"))
+            jobs += L"No Anthropic key is stored: add one below to run your model work here.\r\n";
+        else if (model->flag("refused"))
+            jobs += L"Anthropic refused your Anthropic key: paste a new one below.\r\n";
+    }
     if (const Json* today = st.get("today")) {
         jobs += L"\r\nToday: " + fmtNum(today->num("done")) + L" done, " + fmtNum(today->num("failed")) + L" failed, " +
                 fmtNum(today->num("seconds") / 60.0) + L" min of work.\r\n";
@@ -299,6 +319,11 @@ void showStatus() {
     }
     setText(IDC_PAUSE, limitsPaused() ? L"Resume" : L"Pause");
     Button_SetCheck(ctl(IDC_LOGON), runAtLogon() ? BST_CHECKED : BST_UNCHECKED);
+    Button_SetCheck(ctl(IDC_LOCAL), localModelChosen() ? BST_CHECKED : BST_UNCHECKED);
+    bool haveKey = fileExists(homeFile(L"anthropic.key"));
+    setText(IDC_KEY_STATE, haveKey ? L"An Anthropic key is stored, encrypted for this Windows user. It is sent only to Anthropic."
+                                   : L"No Anthropic key is stored.");
+    EnableWindow(ctl(IDC_KEY_CLEAR), haveKey);
 }
 
 void refresh() {
@@ -373,6 +398,66 @@ void toggleLogon() {
     showStatus();
 }
 
+// ---------------------------------------------------------------- the Anthropic key and the model-work option
+
+void toggleLocalModel() {
+    bool on = Button_GetCheck(ctl(IDC_LOCAL)) == BST_CHECKED;
+    if (!setLocalModel(on)) {
+        MessageBoxW(g.wnd, L"The setting could not be saved.", kAppName, MB_OK | MB_ICONERROR);
+        return;
+    }
+    logLine(on ? L"model work on this machine: on" : L"model work on this machine: off");
+    bool haveKey = fileExists(homeFile(L"anthropic.key"));
+    setText(IDC_DETAIL, on ? (haveKey ? L"Your model work now runs here, with your own Anthropic key. Restarting the worker."
+                                      : L"Add your Anthropic key below: your model work runs here once one is stored.")
+                           : L"Your model work no longer runs here. Restarting the worker.");
+    g.sup.restart();
+}
+
+void saveAnthropicKey() {
+    HWND edit = ctl(IDC_KEY_EDIT);
+    int n = GetWindowTextLengthW(edit);
+    std::wstring w(static_cast<size_t>(n) + 1, L'\0');
+    GetWindowTextW(edit, w.data(), n + 1);
+    w.resize(static_cast<size_t>(n));
+    std::string key = trim(narrow(w));
+    SecureZeroMemory(w.data(), w.size() * sizeof(wchar_t));
+    SetWindowTextW(edit, L"");
+    bool plausible = key.size() >= 20 && key.size() <= 400 && key.find_first_of(" \t\r\n\"'") == std::string::npos;
+    if (!plausible) {
+        bool empty = key.empty();
+        SecureZeroMemory(key.data(), key.size());
+        MessageBoxW(g.wnd, empty ? L"Paste your Anthropic API key into the box first."
+                                 : L"That does not look like an Anthropic API key. Copy it again from the Anthropic Console.",
+                    kAppName, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    bool ok = saveSecret(L"anthropic", key);
+    SecureZeroMemory(key.data(), key.size());
+    if (!ok) {
+        MessageBoxW(g.wnd, L"The key could not be stored.", kAppName, MB_OK | MB_ICONERROR);
+        return;
+    }
+    logLine(L"Anthropic key changed (DPAPI, this Windows user)");
+    setText(IDC_DETAIL, L"Your Anthropic key is stored. Restarting the worker so it is used.");
+    g.sup.restart();
+    showStatus();
+}
+
+void clearAnthropicKey() {
+    if (MessageBoxW(g.wnd, L"Remove your Anthropic key from this computer? Your model work will not run here until you add one again.",
+                    kAppName, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+        return;
+    if (!deleteSecret(L"anthropic")) {
+        MessageBoxW(g.wnd, L"The key could not be removed.", kAppName, MB_OK | MB_ICONERROR);
+        return;
+    }
+    logLine(L"Anthropic key removed");
+    setText(IDC_DETAIL, L"Your Anthropic key is removed. Restarting the worker.");
+    g.sup.restart();
+    showStatus();
+}
+
 void viewLog() {
     std::wstring path = logsDir() + L"\\worker.log";
     if (!fileExists(path)) path = logsDir() + L"\\python.log";
@@ -433,6 +518,17 @@ void layout() {
     y = gy + S(136);
     place(IDC_LOGON, x, y, w, lineH); y += lineH + S(6);
 
+    int my = y;
+    place(IDC_MODEL_GROUP, x, my, w, S(118));
+    y = my + S(22);
+    place(IDC_LOCAL, lx, y, w - S(24), lineH); y += lineH + S(4);
+    place(IDC_KEY_STATE, lx, y + S(2), w - S(24), lineH); y += lineH + S(4);
+    int kb = S(90);
+    place(IDC_KEY_EDIT, lx, y, w - S(24) - 2 * kb - S(16), lineH + S(2));
+    place(IDC_KEY_SAVE, x + w - S(12) - 2 * kb - S(8), y - S(2), kb, S(28));
+    place(IDC_KEY_CLEAR, x + w - S(12) - kb, y - S(2), kb, S(28));
+    y = my + S(126);
+
     place(IDC_JOBS_LBL, x, y, w, S(18)); y += S(20);
     place(IDC_JOBS, x, y, w, S(110)); y += S(118);
     place(IDC_LOG_LBL, x, y, w, S(18)); y += S(20);
@@ -463,6 +559,15 @@ void createControls() {
     make(L"BUTTON", L"Save limits", BS_PUSHBUTTON | WS_TABSTOP, IDC_SAVE);
     make(L"BUTTON", L"Pause", BS_PUSHBUTTON | WS_TABSTOP, IDC_PAUSE);
     make(L"BUTTON", L"Start Cobalt Worker when I sign in to Windows", BS_AUTOCHECKBOX | WS_TABSTOP, IDC_LOGON);
+    make(L"BUTTON", L"Your Anthropic key", BS_GROUPBOX, IDC_MODEL_GROUP);
+    make(L"BUTTON", L"Run my model work on this machine (my Anthropic key stays here)", BS_AUTOCHECKBOX | WS_TABSTOP,
+         IDC_LOCAL);
+    make(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, IDC_KEY_STATE);
+    make(L"EDIT", L"", ES_PASSWORD | ES_AUTOHSCROLL | WS_TABSTOP, IDC_KEY_EDIT, WS_EX_CLIENTEDGE);
+    make(L"BUTTON", L"Save key", BS_PUSHBUTTON | WS_TABSTOP, IDC_KEY_SAVE);
+    make(L"BUTTON", L"Clear key", BS_PUSHBUTTON | WS_TABSTOP, IDC_KEY_CLEAR);
+    Edit_SetCueBannerTextFocused(ctl(IDC_KEY_EDIT), L"Paste a new Anthropic API key", TRUE);
+    SendMessageW(ctl(IDC_KEY_EDIT), EM_SETLIMITTEXT, 400, 0);
     make(L"STATIC", L"Jobs", SS_LEFT, IDC_JOBS_LBL);
     make(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, IDC_JOBS, WS_EX_CLIENTEDGE);
     make(L"STATIC", L"Log", SS_LEFT, IDC_LOG_LBL);
@@ -532,7 +637,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE: layout(); return 0;
     case WM_GETMINMAXINFO: {
         auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
-        mm->ptMinTrackSize = {S(520), S(560)};
+        mm->ptMinTrackSize = {S(560), S(690)};
         return 0;
     }
     case WM_TIMER:
@@ -544,6 +649,9 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_SAVE: saveLimits(); break;
         case IDC_PAUSE: togglePause(); break;
         case IDC_LOGON: if (HIWORD(wp) == BN_CLICKED) { setRunAtLogon(Button_GetCheck(ctl(IDC_LOGON)) == BST_CHECKED); } break;
+        case IDC_LOCAL: if (HIWORD(wp) == BN_CLICKED) toggleLocalModel(); break;
+        case IDC_KEY_SAVE: saveAnthropicKey(); break;
+        case IDC_KEY_CLEAR: clearAnthropicKey(); break;
         case IDC_VIEWLOG: viewLog(); break;
         case IDC_HIDE: case IDCANCEL: ShowWindow(hwnd, SW_HIDE); break;
         default: break;
@@ -599,7 +707,7 @@ int runApp(HINSTANCE inst, bool show) {
     RegisterClassExW(&wc);
 
     UINT sysDpi = GetDpiForSystem();
-    int w = MulDiv(600, static_cast<int>(sysDpi), 96), h = MulDiv(680, static_cast<int>(sysDpi), 96);
+    int w = MulDiv(640, static_cast<int>(sysDpi), 96), h = MulDiv(810, static_cast<int>(sysDpi), 96);
     HWND hwnd = CreateWindowExW(WS_EX_CONTROLPARENT, kWindowClass, kAppName, WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX,
                                 CW_USEDEFAULT, CW_USEDEFAULT, w, h, nullptr, nullptr, inst, nullptr);
     if (!hwnd) return 1;

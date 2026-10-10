@@ -219,6 +219,28 @@ bool setPaused(bool paused) {
     return writeJsonFile(path, lim);
 }
 
+bool localModelChosen() { return readJsonFile(homeFile(L"limits.json")).flag("local_model"); }
+
+bool setLocalModel(bool on) {
+    std::wstring path = homeFile(L"limits.json");
+    Json lim = readJsonFile(path);
+    lim.set("local_model", Json::boolean(on));
+    return writeJsonFile(path, lim);
+}
+
+std::string anthropicTestUrl() {
+    std::string u = trim(readJsonFile(homeFile(L"contributor.json")).str("anthropic_url"));
+    while (!u.empty() && u.back() == '/') u.pop_back();
+    for (const char* prefix : {"http://127.0.0.1:", "http://localhost:"}) {
+        std::string p = prefix;
+        if (u.size() > p.size() && u.compare(0, p.size(), p) == 0) {
+            std::string port = u.substr(p.size());
+            if (port.size() <= 5 && port.find_first_not_of("0123456789") == std::string::npos) return u;
+        }
+    }
+    return {};
+}
+
 int cpuCount() {
     DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     return n ? static_cast<int>(n) : 1;
