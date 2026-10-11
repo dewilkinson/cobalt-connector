@@ -1,5 +1,5 @@
 # What leaves your machine (full list, from the code: README.md, section "What leaves your machine"):
-# - To the Cobalt server (HTTPS with the default address): your partner key in X-Cobalt-Contributor on every request
+# - To the Cobalt server (always HTTPS; a plain-http address is refused): your partner key in X-Cobalt-Contributor on every request
 #   (how the machine signs in; the server keeps only its SHA-256), the machine id ("cc-" + 12 random hex), the
 #   computer's name, the name you chose, cores, memory, your limits, versions, job results or error messages, and
 #   model answers with token counts. Other partners see the machine only by its label (the name you chose, or
@@ -17,7 +17,8 @@ The installer ships no worker code. CobaltConnector.exe starts this script in th
 
 with a minimal environment that carries:
 
-    COBALT_FLEET_URL     the fleet server (default https://api.bluesec.ai)
+    COBALT_FLEET_URL     the fleet server (default https://api.bluesec.ai); only an https:// address is used
+                         (or plain http to this machine, for tests) - any other is ignored for the default
     COBALT_CONTRIB_KEY   the owner's partner key (decrypted from DPAPI by the app, never written to disk)
     COBALT_CONTRIB_HOME  %LOCALAPPDATA%\\CobaltConnector - settings, limits, status, cache, builds
     COBALT_APP_VERSION   the app's own version (e.g. 1.2.0), sent in the hello so the server knows it
@@ -112,8 +113,32 @@ def builds_dir() -> Path:
     return p
 
 
+LOOPBACK_RE = re.compile(r"^http://(127\.0\.0\.1|localhost):\d{1,5}$")
+_refused_relay_logged = False
+
+
+def secure_relay(url: str) -> bool:
+    """A server address the partner key may be sent to: https://, or plain http only to this machine
+    (http://127.0.0.1:<port> or http://localhost:<port>, which the tests use). Anything else would send
+    the key in clear text."""
+    u = (url or "").strip().rstrip("/")
+    if u[:8].lower() == "https://" and len(u) > 8:
+        return True
+    return bool(LOOPBACK_RE.match(u))
+
+
 def relay() -> str:
-    return (os.environ.get("COBALT_FLEET_URL") or DEFAULT_RELAY).strip().rstrip("/")
+    global _refused_relay_logged
+    r = (os.environ.get("COBALT_FLEET_URL") or "").strip().rstrip("/")
+    if not r:
+        return DEFAULT_RELAY
+    if not secure_relay(r):
+        if not _refused_relay_logged:
+            _refused_relay_logged = True
+            log(f"the server address {r} is not secure: the connector only talks to a server over https, "
+                f"so it uses {DEFAULT_RELAY} instead")
+        return DEFAULT_RELAY
+    return r
 
 
 def partner_key() -> str:

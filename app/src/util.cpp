@@ -3,8 +3,10 @@
 #include <bcrypt.h>
 #include <shlobj.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <mutex>
 #include <vector>
@@ -221,10 +223,46 @@ Json readJsonFile(const std::wstring& path) {
 
 bool writeJsonFile(const std::wstring& path, const Json& j) { return writeFileAtomic(path, j.dump(2)); }
 
-std::string relayUrl() {
-    std::string r = trim(readJsonFile(homeFile(L"contributor.json")).str("relay"));
+// http://127.0.0.1:<port> or http://localhost:<port> and nothing after the port: this machine only.
+static bool loopbackHttp(const std::string& u) {
+    for (const char* prefix : {"http://127.0.0.1:", "http://localhost:"}) {
+        std::string p = prefix;
+        if (u.size() > p.size() && u.compare(0, p.size(), p) == 0) {
+            std::string port = u.substr(p.size());
+            if (port.size() <= 5 && port.find_first_not_of("0123456789") == std::string::npos) return true;
+        }
+    }
+    return false;
+}
+
+std::string normalRelay(const std::string& url) {
+    std::string r = trim(url);
     while (!r.empty() && r.back() == '/') r.pop_back();
-    return r.empty() ? std::string(kDefaultRelay) : r;
+    return r;
+}
+
+bool secureRelay(const std::string& url) {
+    std::string r = normalRelay(url);
+    if (r.size() > 8 && _strnicmp(r.c_str(), "https://", 8) == 0) return true;
+    return loopbackHttp(r);
+}
+
+std::wstring insecureRelayMessage(const std::string& url) {
+    return L"The server address " + widen(normalRelay(url)) +
+           L" is not secure: Cobalt Connector only talks to a server over https.";
+}
+
+std::string relayUrl() {
+    std::string r = normalRelay(readJsonFile(homeFile(L"contributor.json")).str("relay"));
+    if (r.empty()) return std::string(kDefaultRelay);
+    if (!secureRelay(r)) {
+        // an edited contributor.json never downgrades the connection: the hosted backend is used instead
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            logLine(insecureRelayMessage(r) + L" The stored address is ignored; using " + widen(kDefaultRelay) + L".");
+        return std::string(kDefaultRelay);
+    }
+    return r;
 }
 
 std::string machineId() {
@@ -354,14 +392,7 @@ int setLimitsFromFile(const std::wstring& file, std::wstring& message) {
 std::string anthropicTestUrl() {
     std::string u = trim(readJsonFile(homeFile(L"contributor.json")).str("anthropic_url"));
     while (!u.empty() && u.back() == '/') u.pop_back();
-    for (const char* prefix : {"http://127.0.0.1:", "http://localhost:"}) {
-        std::string p = prefix;
-        if (u.size() > p.size() && u.compare(0, p.size(), p) == 0) {
-            std::string port = u.substr(p.size());
-            if (port.size() <= 5 && port.find_first_not_of("0123456789") == std::string::npos) return u;
-        }
-    }
-    return {};
+    return loopbackHttp(u) ? u : std::string();
 }
 
 int cpuCount() {

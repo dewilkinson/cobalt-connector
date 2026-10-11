@@ -136,3 +136,46 @@ def test_a_plain_answer_still_comes_back(boot, monkeypatch):
         assert server.seen[0]["key"] == "test-key"
     finally:
         server.close()
+
+
+@pytest.mark.parametrize("url", [
+    "http://api.bluesec.ai",
+    "http://192.168.1.145:47101",
+    "http://127.0.0.2:8000",
+    "http://localhost.evil.com:80",
+    "http://127.0.0.1:80@evil.com",
+    "api.bluesec.ai",
+    "ftp://api.bluesec.ai",
+    "https://",
+])
+def test_a_plain_http_server_address_is_never_used(boot, monkeypatch, url):
+    monkeypatch.setenv("COBALT_FLEET_URL", url)
+    assert not boot.secure_relay(url)
+    assert boot.relay() == boot.DEFAULT_RELAY
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.bluesec.ai",
+    "https://api.bluesec.ai/",
+    "HTTPS://fleet.example.com:8443",
+    "http://127.0.0.1:8000",
+    "http://localhost:47101/",
+])
+def test_an_https_or_loopback_server_address_is_used(boot, monkeypatch, url):
+    monkeypatch.setenv("COBALT_FLEET_URL", url)
+    assert boot.secure_relay(url)
+    assert boot.relay() == url.rstrip("/")
+
+
+def test_no_server_address_is_the_default(boot, monkeypatch):
+    monkeypatch.delenv("COBALT_FLEET_URL", raising=False)
+    assert boot.relay() == boot.DEFAULT_RELAY
+
+
+def test_a_refused_address_is_logged_once_without_the_key(boot, monkeypatch, capsys):
+    monkeypatch.setenv("COBALT_FLEET_URL", "http://fleet.example.com")
+    assert boot.relay() == boot.DEFAULT_RELAY
+    assert boot.relay() == boot.DEFAULT_RELAY
+    out = capsys.readouterr().out
+    assert out.count("is not secure") == 1
+    assert "test-key" not in out

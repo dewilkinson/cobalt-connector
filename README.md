@@ -68,7 +68,9 @@ CobaltConnectorSetup.exe /VERYSILENT /SUPPRESSMSGBOXES /DIR="C:\Cobalt Connector
 A `*FILE` parameter names a file holding just the key. `/PARTNERKEY=...` and `/ANTHROPICKEY=...` work as
 well, but a key on the command line is written into Setup's log when `/LOG` is used, so prefer the file
 forms. A silent install without a partner key, on a machine that has none stored, installs nothing.
-`/RELAY=` points the app at a fleet server other than the default (`https://api.bluesec.ai`).
+`/RELAY=` points the app at a fleet server other than the default (`https://api.bluesec.ai`). The address must
+start with `https://`: the app refuses a plain `http://` address, because your partner key would travel in clear
+text (the key check fails and nothing is stored).
 `/MACHINENAME=` sets the name Cobalt shows for the machine (see [Settings](#settings)).
 
 **Update mode.** `/UPDATE`, or a silent install on a machine that already holds a partner key and is given none,
@@ -216,8 +218,8 @@ that's a bug - please open an issue.
 - **Your Anthropic key goes only to Anthropic** (`https://api.anthropic.com`), and only if you've turned on "Run my
   model work on this machine". It is never sent to Cobalt. With that option off, the work process is never given the
   key: it stays encrypted on your machine.
-- **Your partner key is sent to the Cobalt server** with every request the app makes there, over HTTPS with the
-  default address. That's how the machine signs in, the same way a password is. The server keeps only a SHA-256 hash
+- **Your partner key is sent to the Cobalt server** with every request the app makes there, always over HTTPS (the
+  app refuses a plain `http://` server address). That's how the machine signs in, the same way a password is. The server keeps only a SHA-256 hash
   of it, and the code never logs it. No request that carries it follows a redirect: a redirect is treated as an
   error, so the key can't be passed on to another address.
 - The Cobalt server also gets a **short description of the machine** (a random id, the computer's name, the name you
@@ -241,7 +243,9 @@ that's a bug - please open an issue.
 
 The address is `https://api.bluesec.ai` unless you installed with `/RELAY=`. Every request below carries your
 **partner key** in the `X-Cobalt-Contributor` header, and goes over HTTPS when the address starts with `https://`
-(the default does; the app doesn't refuse a plain `http://` address you give it, so don't give it one). None of these
+(the app refuses any other address: a plain `http://` one would send your key in clear text. The only exception is
+`http://127.0.0.1:<port>` or `http://localhost:<port>`, this machine itself, which the tests use. An address edited
+into `contributor.json` that breaks this rule is ignored, and the default is used). None of these
 requests follows a redirect: the app, the bootstrap and the worker code all treat a redirect as an error, so the key
 goes to this address and nowhere else.
 
@@ -331,7 +335,7 @@ Cobalt server and, with model work on, to Anthropic, and nowhere else.
   decrypt it and the work process never has it. It is sent only to Anthropic, over HTTPS, in the `x-api-key` header, and only for your own model
   work. It is never sent to Cobalt.
 - **Your partner key is sent to the Cobalt server**, in the `X-Cobalt-Contributor` header of every request listed
-  above (over HTTPS with the default address): the installer's check, each hello, each job request and result, each
+  above (always over HTTPS): the installer's check, each hello, each job request and result, each
   download from the server, and the update check. It has to be: it's how the machine signs in. None of those requests
   follows a redirect, so it can't be forwarded to another address. The server stores only
   its SHA-256 hash and the code never logs it. It is never sent to GitHub or Anthropic. On disk it's kept only
@@ -372,7 +376,7 @@ question, built by the Cobalt server from what you can already see there.
   text of a question or an answer.
 - The window's **Save key** and **Clear key** change or remove the Anthropic key later; it is stored the same way.
 - An update never touches the keys.
-- The partner key is sent only to the fleet server (with every request, over HTTPS with the default address: it's
+- The partner key is sent only to the fleet server (with every request, always over HTTPS: it's
   how the machine signs in);
   an Anthropic key is sent only to Anthropic. See [Keys](#keys).
 - The fleet's owner can revoke a partner key at any time, which ends the machine's access at once.
@@ -401,6 +405,9 @@ CobaltConnector.exe --run-at-logon on|off
 CobaltConnector.exe --quit                          stop the running app and its work process
 CobaltConnector.exe --version
 ```
+
+A `--relay` address, or a `relay=` line, must start with `https://` (or be `http://127.0.0.1:<port>` or
+`http://localhost:<port>`, for tests); any other is refused with exit 1 and nothing is sent or stored.
 
 ## Build from source
 

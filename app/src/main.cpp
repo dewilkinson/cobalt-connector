@@ -1,5 +1,5 @@
 // What leaves your machine (full list, from the code: README.md, section "What leaves your machine"):
-// - To the Cobalt server (HTTPS with the default address): your partner key in X-Cobalt-Contributor on every request
+// - To the Cobalt server (always HTTPS; a plain-http address is refused): your partner key in X-Cobalt-Contributor on every request
 //   (how the machine signs in; the server keeps only its SHA-256), the machine id ("cc-" + 12 random hex), the
 //   computer's name, the name you chose, cores, memory, your limits, versions, job results or error messages, and
 //   model answers with token counts. Other partners see the machine only by its label (the name you chose, or

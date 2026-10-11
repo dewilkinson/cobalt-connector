@@ -2,7 +2,8 @@
 // with the key in X-Cobalt-Contributor, exactly as the bootstrap and the pull loop say hello (with the app's
 // version and the machine's chosen name, when one is set). Exit 0: accepted. 1: refused (or not a key at
 // all). 2: could not check (no network, or the server does not answer the fleet route), which the installer
-// offers to continue past offline.
+// offers to continue past offline. A server address that is not https (secureRelay) is refused (exit 1)
+// before anything is sent.
 #include "app.hpp"
 
 #include <winhttp.h>
@@ -39,7 +40,12 @@ std::wstring winError(DWORD e) {
 
 }  // namespace
 
-int checkKey(const std::string& rawKey, const std::string& relay, std::wstring& message) {
+int checkKey(const std::string& rawKey, const std::string& rawRelay, std::wstring& message) {
+    std::string relay = normalRelay(rawRelay);
+    if (!secureRelay(relay)) {       // the key would go in clear text: refused, never sent
+        message = insecureRelayMessage(relay);
+        return 1;
+    }
     std::string key = trim(rawKey);
     bool printable = !key.empty();
     for (unsigned char c : key)

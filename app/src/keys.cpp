@@ -63,7 +63,8 @@ bool deleteSecret(const wchar_t* name) {
     return DeleteFileW(p.c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND;
 }
 
-// The installer writes `partner=...`, `anthropic=...` and optionally `relay=...` into a file in its own
+// The installer writes `partner=...`, `anthropic=...` and optionally `relay=...` (https:// only, see
+// secureRelay; any other address refuses the whole file and stores nothing) into a file in its own
 // temporary folder (so no key is ever on a command line) and calls --set-keys <file>. The file is
 // overwritten and deleted once read. An empty `anthropic=` removes a stored Anthropic key. `partner=` may be
 // left out when a partner key is already stored (a reinstall that only changes the Anthropic key).
@@ -95,6 +96,14 @@ int setKeysFromFile(const std::wstring& file, std::wstring& message) {
         else if (k == "relay") relay = v;
     }
     SecureZeroMemory(text.data(), text.size());
+    relay = normalRelay(relay);
+    if (!relay.empty() && !secureRelay(relay)) {     // refused before anything is stored
+        SecureZeroMemory(partner.data(), partner.size());
+        SecureZeroMemory(anthropic.data(), anthropic.size());
+        logLine(L"keys not stored: " + insecureRelayMessage(relay));
+        message = insecureRelayMessage(relay) + L" Nothing was stored.";
+        return 1;
+    }
     bool ok = true;
     if (partner.empty()) {
         std::optional<std::string> stored = loadSecret(L"partner");
@@ -114,7 +123,6 @@ int setKeysFromFile(const std::wstring& file, std::wstring& message) {
     if (!relay.empty()) {
         std::wstring cfgPath = homeFile(L"contributor.json");
         Json cfg = readJsonFile(cfgPath);
-        while (!relay.empty() && relay.back() == '/') relay.pop_back();
         cfg.set("relay", Json::string(relay));
         writeJsonFile(cfgPath, cfg);
     }

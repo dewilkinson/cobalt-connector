@@ -74,7 +74,12 @@ void logLine(const std::wstring& text);
 // ---- settings shared with the Python loop (util.cpp)
 Json readJsonFile(const std::wstring& path);
 bool writeJsonFile(const std::wstring& path, const Json& j);
-std::string relayUrl();            // contributor.json "relay", else the hosted backend
+std::string relayUrl();            // contributor.json "relay" when secureRelay(), else the hosted backend
+// A server address the partner key may be sent to: https://, or plain http only to this machine
+// (http://127.0.0.1:<port> or http://localhost:<port>, for tests). Anything else would send the key in clear text.
+bool secureRelay(const std::string& url);
+std::string normalRelay(const std::string& url);              // trimmed, without trailing slashes
+std::wstring insecureRelayMessage(const std::string& url);    // the plain sentence that refuses one
 std::string machineId();           // contributor.json "machine", made once: "cc-" and 12 random hex digits
 bool limitsPaused();
 bool setPaused(bool paused);
