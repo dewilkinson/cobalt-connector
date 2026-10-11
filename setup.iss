@@ -26,7 +26,7 @@
   #define OutDir "dist"
 #endif
 #ifndef AppVersion
-  #define AppVersion "1.2.1"
+  #define AppVersion "1.3.0"
 #endif
 #define AppExe "CobaltConnector.exe"
 #define LegacyExe "CobaltWorker.exe"
@@ -724,10 +724,16 @@ end;
 // ------------------------------------------------------------------ uninstalling
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Code: Integer;
 begin
   if CurUninstallStep = usUninstall then begin
     StopRunningApp(ExpandConstant('{app}\{#AppExe}'));
     StopRunningApp(LegacyAppDir() + '\{#LegacyExe}');
+    // this machine's sign-in is retired on the Cobalt server (best effort, 5 s) and its device key deleted from
+    // Windows' key store; the pass in token.json goes with the settings folder below
+    if FileExists(ExpandConstant('{app}\{#AppExe}')) then
+      Exec(ExpandConstant('{app}\{#AppExe}'), '--retire', '', SW_HIDE, ewWaitUntilTerminated, Code);
   end else if CurUninstallStep = usPostUninstall then begin
     RegDeleteValue(HKEY_CURRENT_USER, RunKey, RunValue);
     RegDeleteValue(HKEY_CURRENT_USER, RunKey, LegacyRunValue);

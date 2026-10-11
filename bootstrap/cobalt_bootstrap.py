@@ -1,9 +1,13 @@
 # What leaves your machine (full list, from the code: README.md, section "What leaves your machine"):
-# - To the Cobalt server (always HTTPS; a plain-http address is refused): your partner key in X-Cobalt-Contributor on every request
-#   (how the machine signs in; the server keeps only its SHA-256), the machine id ("cc-" + 12 random hex), the
+# - To the Cobalt server (always HTTPS; a plain-http address is refused): a one-hour pass in X-Cobalt-Device on every
+#   request (Cobalt Connector 1.3.0 gets it by signing with a key of its own that never leaves the machine; your
+#   partner key was sent once, when the app registered that key, and the server keeps only SHA-256 hashes of the key
+#   and of each pass - a 1.2.x app or an older server: the partner key in X-Cobalt-Contributor instead), the
+#   machine id ("cc-" + 12 random hex), the
 #   computer's name, the name you chose, cores, memory, your limits, versions, job results or error messages, and
 #   model answers with token counts. Other partners see the machine only by its label (the name you chose, or
-#   "<owner>'s machine N"), never the computer's name or the machine id. No request with the key follows a redirect.
+#   "<owner>'s machine N"), never the computer's name or the machine id. No request with a pass or a key follows a
+#   redirect.
 # - To Anthropic, only with model work on: your Anthropic key and your own question's text. Never to Cobalt. With
 #   model work off the work process is never given the key.
 # - To GitHub: a plain download request for an app update. No key, no id.
@@ -19,19 +23,26 @@ with a minimal environment that carries:
 
     COBALT_FLEET_URL     the fleet server (default https://api.bluesec.ai); only an https:// address is used
                          (or plain http to this machine, for tests) - any other is ignored for the default
-    COBALT_CONTRIB_KEY   the owner's partner key (decrypted from DPAPI by the app, never written to disk)
+    COBALT_TOKEN_FILE    Cobalt Connector 1.3.0: the token.json the app keeps fresh - a one-hour pass the app gets by
+                         signing with the machine's own device key. Read again whenever it changes; sent in
+                         X-Cobalt-Device. The work process is then never given the partner key.
+    COBALT_CONTRIB_KEY   only when there is no token file (a 1.2.x app, or a server that does not offer passes yet):
+                         the owner's partner key (decrypted from DPAPI by the app, never written to disk), sent in
+                         X-Cobalt-Contributor
     COBALT_CONTRIB_HOME  %LOCALAPPDATA%\\CobaltConnector - settings, limits, status, cache, builds
     COBALT_APP_VERSION   the app's own version (e.g. 1.2.0), sent in the hello so the server knows it
     COBALT_MACHINE_NAME  the name the owner chose for this machine ("" = its computer name), sent in the hello
 
 What it does, every time it is started:
 
-1. Says hello to the fleet (POST /api/fleet/hello, the partner key in the X-Cobalt-Contributor header),
-   with the app's version and the machine's chosen name. The answer names the code hash the fleet runs.
-   A refused key stops here: nothing is downloaded. An app the fleet calls too old to take work
-   ("outdated") stops here too: status.json says so, with the fleet's reason, and it asks again later.
-2. If build\\<hash>\\ is not already here and verified, downloads GET /api/fleet/build/<hash>.zip (same
-   header), checks that the server labelled it with that hash (X-Cobalt-Code), that no file in it
+1. Says hello to the fleet (POST /api/fleet/hello, with the pass - or, from an older app, the partner key),
+   with the app's version and the machine's chosen name. The answer names the code hash the fleet runs and
+   the hash of its pull loop (`loop`). A refused key or a removed machine stops here: nothing is downloaded.
+   A pass the server no longer takes leaves `token.stale` beside token.json, so the app renews it at once,
+   and is treated as an outage meanwhile. An app the fleet calls too old to take work ("outdated") stops
+   here too: status.json says so, with the fleet's reason, and it asks again later.
+2. If build\\<hash>\\ is not already here and verified, or its pull loop hashes differently from the hello's
+   `loop`, downloads GET /api/fleet/build/<hash>.zip (same header), checks that the server labelled it with that hash (X-Cobalt-Code), that no file in it
    points outside its folder, unpacks it into a temporary folder, and recomputes the code hash from
    the unpacked files. Only a build whose hash matches is moved into place; older builds are removed.
 3. Runs that build's pull loop in this process - the equivalent of
@@ -41,7 +52,7 @@ What it does, every time it is started:
 
 If the fleet cannot be reached and a verified build is already here, the newest one is run (the loop
 waits for the server itself). This script uses the Python standard library only and holds nothing of
-the worker code. It never prints, logs or stores the partner key.
+the worker code. It never prints, logs or stores the partner key or a pass.
 """
 from __future__ import annotations
 
@@ -62,9 +73,12 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-VERSION = "bootstrap-2"
+VERSION = "bootstrap-3"
 DEFAULT_RELAY = "https://api.bluesec.ai"
 CONTRIB_HEADER = "X-Cobalt-Contributor"
+DEVICE_HEADER = "X-Cobalt-Device"          # Cobalt Connector 1.3.0's one-hour pass
+REASON_HEADER = "X-Cobalt-Reason"          # why the server refused a request (a code, never a secret)
+STALE_NAME = "token.stale"                 # left beside token.json when the pass was refused: the app renews it
 CODE_HEADER = "X-Cobalt-Code"
 HASH_RE = re.compile(r"^[0-9a-f]{4,40}$")
 APP_VERSION_RE = re.compile(r"^\d{1,6}\.\d{1,6}\.\d{1,6}$")
@@ -91,6 +105,11 @@ class Moved(Exception):
 
 class Outdated(Exception):
     """The fleet sends this app no work until it is updated (hello state "outdated"); the text says why."""
+
+
+class NotSignedIn(Exception):
+    """Cobalt Connector 1.3.0 has no pass the fleet accepts yet (it is signing in, or renewing an expired one).
+    Nothing is sent without one; it is treated as an outage until the app writes a new token.json."""
 
 
 def log(text: str) -> None:
@@ -143,6 +162,59 @@ def relay() -> str:
 
 def partner_key() -> str:
     return (os.environ.get("COBALT_CONTRIB_KEY") or "").strip()
+
+
+class TokenFile:
+    """The pass Cobalt Connector writes to token.json, read again only when the file changes (one stat per request,
+    so a renewal reaches the running loop without a restart). The pass is never printed or logged."""
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self._stamp: tuple | None = None
+        self._token = ""
+
+    def current(self) -> str:
+        try:
+            st = self.path.stat()
+        except OSError:
+            self._stamp, self._token = None, ""
+            return ""
+        stamp = (st.st_mtime_ns, st.st_size)
+        if stamp != self._stamp:
+            try:
+                got = json.loads(self.path.read_text(encoding="utf-8-sig"))
+                self._token = str(got.get("token") or "").strip() if isinstance(got, dict) else ""
+                self._stamp = stamp
+            except (OSError, ValueError):            # caught mid-write: read again on the next request
+                self._token = ""
+        return self._token
+
+    def mark_stale(self) -> None:
+        """Tell the app the pass it wrote was refused: it renews it at once (at most once a minute)."""
+        try:
+            (self.path.parent / STALE_NAME).touch()
+        except OSError as e:
+            log(f"could not tell Cobalt Connector its sign-in was refused ({e})")
+
+
+_token_file: TokenFile | None = None
+
+
+def token_file() -> TokenFile | None:
+    """The app's token.json when it gave one (COBALT_TOKEN_FILE), else None: then the partner key is used."""
+    global _token_file
+    path = (os.environ.get("COBALT_TOKEN_FILE") or "").strip()
+    if not path:
+        return None
+    if _token_file is None or str(_token_file.path) != str(Path(path)):
+        _token_file = TokenFile(path)
+    return _token_file
+
+
+def reset_credentials() -> None:
+    """Forget the token file read so far (the tests change the environment between cases)."""
+    global _token_file
+    _token_file = None
 
 
 def read_json(path: Path) -> dict:
@@ -209,16 +281,48 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
 
-def request(method: str, path: str, body: dict | None = None, timeout: float = 30.0):
-    """A request to the fleet with the partner key. A redirect is never followed (it raises HTTPError with its 3xx
-    code), so the key is sent to the fleet's own address and nowhere else."""
-    data = json.dumps(body).encode("utf-8") if body is not None else None
+def _open(method: str, path: str, data: bytes | None, timeout: float, header: str, value: str):
     req = urllib.request.Request(relay() + path, data=data, method=method)
-    req.add_header(CONTRIB_HEADER, partner_key())
+    req.add_header(header, value)
     req.add_header("User-Agent", "CobaltConnector/" + VERSION)
     if data is not None:
         req.add_header("Content-Type", "application/json")
     return _OPENER.open(req, timeout=timeout)
+
+
+def request(method: str, path: str, body: dict | None = None, timeout: float = 30.0):
+    """A request to the fleet with the app's pass (X-Cobalt-Device), or - only when the app gave no token file - the
+    partner key. A redirect is never followed (it raises HTTPError with its 3xx code), so the credential is sent to
+    the fleet's own address and nowhere else.
+
+    With a token file: no pass yet means nothing is sent (NotSignedIn). A 401 is retried once when the app has written
+    a new pass meanwhile; otherwise `token.stale` asks the app to renew it and NotSignedIn is raised."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    tf = token_file()
+    if tf is None:
+        return _open(method, path, data, timeout, CONTRIB_HEADER, partner_key())
+    sent = tf.current()
+    if not sent:
+        raise NotSignedIn("Cobalt Connector has not signed this machine in yet")
+    try:
+        return _open(method, path, data, timeout, DEVICE_HEADER, sent)
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        refused = e
+    renewed = tf.current()
+    if renewed and renewed != sent:
+        try:
+            return _open(method, path, data, timeout, DEVICE_HEADER, renewed)
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+            refused = e
+    reason = (refused.headers.get(REASON_HEADER) or "").strip()[:40] if refused.headers else ""
+    refused.close()
+    tf.mark_stale()
+    raise NotSignedIn("the server did not accept this machine's sign-in"
+                      + (f" ({reason})" if reason else "") + "; Cobalt Connector is renewing it")
 
 
 def why(e: urllib.error.HTTPError) -> str:
@@ -320,17 +424,44 @@ def code_hash_of(folder: Path) -> str:
     return out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
 
 
+def loop_file(folder: Path) -> Path:
+    return folder / "src" / "training" / "contributor.py"
+
+
 def verified(folder: Path, want: str) -> bool:
     m = read_json(folder / MARKER)
-    return m.get("code") == want and (folder / "src" / "training" / "contributor.py").is_file()
+    return m.get("code") == want and loop_file(folder).is_file()
 
 
-def fetch(want: str) -> Path:
-    """build\\<want>\\, downloaded and verified if it is not already here."""
+def loop_of(folder: Path) -> str:
+    """The pull loop's own hash, as the server's hello names it (`loop`): the first 16 hex of the sha256 of
+    contributor.py with its line endings as LF. It is not part of the code hash, so a build of the same hash can hold
+    an older loop."""
+    try:
+        raw = loop_file(folder).read_bytes().replace(b"\r\n", b"\n")
+    except OSError:
+        return ""
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def knows_tokens(folder: Path) -> bool:
+    """Whether this build's pull loop can sign in with the app's token file (an older one knows the partner key
+    only, which a 1.3.0 app no longer gives the work process)."""
+    try:
+        return b"COBALT_TOKEN_FILE" in loop_file(folder).read_bytes()
+    except OSError:
+        return False
+
+
+def fetch(want: str, loop: str | None = None) -> Path:
+    """build\\<want>\\, downloaded and verified if it is not already here - or if its pull loop is not the one the
+    fleet's hello named (`loop`; an older server names none, and then the held build stands)."""
     base = builds_dir()
     final = base / want
-    if verified(final, want):
+    if verified(final, want) and (not loop or loop_of(final) == loop):
         return final
+    if verified(final, want):
+        log(f"the build {want} here has an older pull loop; downloading it again")
     write_status("code", code=want)
     log(f"downloading the worker build {want}")
     work = Path(tempfile.mkdtemp(prefix=f".tmp-{want}-", dir=base))
@@ -350,7 +481,7 @@ def fetch(want: str) -> Path:
         if got != want:
             raise BadBuild(f"the build's files hash to {got or 'nothing'}, not {want}: discarded")
         write_json(unpacked / MARKER, {"code": want, "zip_sha256": sha, "verified_at": time.time(),
-                                       "relay": relay()})
+                                       "relay": relay(), "loop": loop_of(unpacked)})
         if final.exists():
             shutil.rmtree(final, ignore_errors=True)
         os.replace(unpacked, final)
@@ -364,9 +495,11 @@ def fetch(want: str) -> Path:
 
 
 def newest_verified() -> Path | None:
+    """The newest verified build here; with a token file, only one whose pull loop can use it."""
     best: tuple[float, Path] | None = None
+    tokens = token_file() is not None
     for d in builds_dir().iterdir():
-        if d.is_dir() and HASH_RE.match(d.name) and verified(d, d.name):
+        if d.is_dir() and HASH_RE.match(d.name) and verified(d, d.name) and (not tokens or knows_tokens(d)):
             t = float(read_json(d / MARKER).get("verified_at") or 0)
             if best is None or t > best[0]:
                 best = (t, d)
@@ -395,8 +528,9 @@ def prepare() -> Path:
         try:
             reply = hello(have.name if have else "")
             want = str(reply["code"])
+            loop = str(reply.get("loop") or "").strip().lower()
             try:
-                return fetch(want)
+                return fetch(want, loop=loop if HASH_RE.match(loop) else None)
             except Moved as e:
                 log(f"the fleet moved to new code while downloading ({e}); asking again")
                 continue
@@ -405,8 +539,15 @@ def prepare() -> Path:
                 f"asking again in {OUTDATED_WAIT_S / 60:.0f} minutes")
             wait(OUTDATED_WAIT_S, "outdated", why=str(e))
             continue
+        except NotSignedIn as e:
+            if have is not None:
+                log(f"{e}; running the build already here, {have.name}")
+                return have
+            log(f"{e}; trying again in {backoff:.0f} s")
+            wait(backoff, "offline", "Cobalt Connector is signing this machine in to the Cobalt server")
+            backoff = min(60.0, backoff * 2)
         except Refused as e:
-            log(f"the fleet refused the partner key ({e}); nothing is downloaded")
+            log(f"the fleet refused this machine ({e}); nothing is downloaded")
             wait(REFUSED_WAIT_S, "refused", f"the partner key was refused: {e}")
             continue
         except BadBuild as e:
@@ -432,8 +573,8 @@ def main(argv: list[str]) -> int:
     if "--pull" not in argv:
         print(__doc__)
         return 1
-    if not partner_key():
-        log("no partner key was given (COBALT_CONTRIB_KEY): start Cobalt Connector from its app")
+    if token_file() is None and not partner_key():
+        log("no sign-in was given (COBALT_TOKEN_FILE or COBALT_CONTRIB_KEY): start Cobalt Connector from its app")
         write_status("refused", "no partner key is stored")
         return 2
     write_status("starting")

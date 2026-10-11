@@ -4,7 +4,9 @@
 // beside it, running bootstrap\cobalt_bootstrap.py. The bootstrap downloads the worker code the fleet
 // runs (by its hash, and only once the partner key is accepted) and runs that code's pull loop; the app
 // shows what the loop reports in status.json. The network calls the app makes itself, over WinHTTP, are
-// --check-key (the installer's key check) and the update check and download (update.cpp).
+// the sign-in (token.cpp: enrol once with the partner key, then a one-hour pass renewed with the machine's own
+// device key, devkey.cpp), --check-key (the installer's key check, which is the enrol), and the update check and
+// download (update.cpp).
 #pragma once
 #include <windows.h>
 
@@ -124,6 +126,67 @@ std::optional<std::string> loadSecret(const wchar_t* name);
 bool deleteSecret(const wchar_t* name);
 int setKeysFromFile(const std::wstring& file, std::wstring& message);
 
+// ---- one request to the Cobalt server, never following a redirect (net.cpp)
+struct ServerReply {
+    DWORD status = 0;
+    std::string body;
+    Json json;                 // the body, when it is a JSON object
+    std::string reason;        // X-Cobalt-Reason (or the body's "reason"): a code, never a secret
+    int retryAfter = 0;        // seconds, from Retry-After
+    std::wstring error;        // why it could not be sent or answered (then status is 0)
+};
+// `headers` (CRLF-terminated lines; it may hold a key or a pass) is wiped once sent. False when the server could not
+// be reached; otherwise `out` holds whatever status came back, a 3xx included.
+bool serverRequest(const std::string& url, const wchar_t* method, std::wstring& headers, const std::string& body,
+                   ServerReply& out, DWORD timeoutMs = 20000);
+std::wstring winHttpError(DWORD e);
+// The server's host as the app addresses it, as signed requests name it: lowercase, ":port" only when it is not the
+// scheme's default ("api.bluesec.ai", "127.0.0.1:8000").
+std::string relayAudience(const std::string& relay);
+
+// ---- the machine's own device key: ECDSA P-256 in the TPM, else Windows' software key store (devkey.cpp)
+struct DeviceKey {
+    std::string machine;
+    std::string provider;      // "tpm" or "software"
+    std::string publicKey;     // base64url of 0x04 || X || Y
+};
+std::string base64url(const std::string& bytes);                    // without padding
+std::string randomNonce();                                          // 16 random bytes, base64url
+bool openDeviceKey(const std::string& machine, const std::string& provider, DeviceKey& out, std::wstring& err);
+bool createDeviceKey(const std::string& machine, DeviceKey& out, std::wstring& err);   // replaces one of that name
+bool signWithDeviceKey(const DeviceKey& k, const std::string& text, std::string& sigB64u, std::wstring& err);
+bool deleteDeviceKey(const std::string& machine);
+int selfTestDeviceKey(std::wstring& message);                       // --self-test-devkey (build.ps1 runs it)
+int signTestVectors(const std::wstring& outFile, std::wstring& message);   // --sign-test-vector <file>
+
+// ---- signing in to the Cobalt server (token.cpp)
+enum class SignIn {
+    Waiting,       // not decided yet (the first enrol is in flight): the work process is not started
+    Device,        // the work process gets COBALT_TOKEN_FILE and never the partner key
+    Legacy,        // an older server with no device keys, before this machine ever enrolled: the partner key, as 1.2.1
+    Blocked,       // removed by Cobalt's owner, a revoked or refused key: the work process is stopped; `problem` says why
+};
+struct SignInState {
+    SignIn mode = SignIn::Waiting;
+    std::wstring problem;
+    unsigned generation = 0;   // changes whenever `mode` does: the supervisor restarts the work process then
+};
+void startSignIn();            // the app's start: the sign-in thread
+void stopSignIn();
+void wakeSignIn();             // resume from sleep: look again now
+void signInTick();             // every second: token.stale (the work process's pass was refused) renews at once
+SignInState signInState();
+std::wstring tokenFilePath();  // %LOCALAPPDATA%\CobaltConnector\token.json
+// The header line for an app request to the fleet (the update check): the pass, or the partner key only on an older
+// server. False when there is neither yet.
+bool fleetCredential(std::wstring& headerLine);
+// The installer's key check as the enrol itself: 0 accepted (the device is made and holds its first pass), 1 refused,
+// 2 could not check, 3 the server has no device keys yet (the caller checks the key the old way).
+int enrolForKeyCheck(const std::string& key, const std::string& relay, std::wstring& message);
+// --retire (the uninstaller): the device retires itself on the server (best effort, 5 s), its key is deleted from
+// Windows' key store and token.json removed.
+int retireDevice(std::wstring& message);
+
 // ---- the installer's key check (check_key.cpp): 0 accepted, 1 refused, 2 could not check
 int checkKey(const std::string& key, const std::string& relay, std::wstring& message);
 
@@ -189,6 +252,8 @@ private:
     bool start();
     HANDLE job_ = nullptr;
     HANDLE process_ = nullptr;
+    unsigned signInGeneration_ = 0;    // the sign-in the running process was started with
+    bool waitingForSignIn_ = false;
     ULONGLONG startedAt_ = 0;
     ULONGLONG nextStart_ = 0;
     int failures_ = 0;

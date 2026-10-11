@@ -27,7 +27,8 @@ Cobalt Connector was called **Cobalt Worker** up to version 1.1.0. Installing 1.
 - An internet connection to the fleet server
 - A partner key
 
-No administrator rights are needed. Cobalt Connector installs for your Windows user only.
+A TPM (the PC's security chip) is used when there is one, for the key the machine signs in with; none is
+needed. No administrator rights are needed. Cobalt Connector installs for your Windows user only.
 
 ## Install
 
@@ -42,9 +43,10 @@ No administrator rights are needed. Cobalt Connector installs for your Windows u
      hour, or for example `22:00-07:00`), and optionally the **name** Cobalt shows for this machine (empty
      means other partners see it as "<your name>'s machine 1"; you and the fleet's owner see the computer's name).
    - **Your partner key** (required): Next stays disabled until a key is entered, and pressing Next
-     checks it with the fleet server. A refused key stays on the page. If the server cannot be reached
-     you can continue offline: the key is stored and checked when the app first connects, and the tray
-     icon turns red if it is refused then.
+     checks it with the fleet server and registers this machine there in the same step (the one time the key
+     is sent; see [Your keys](#your-keys)). A refused key stays on the page. If the server cannot be reached
+     you can continue offline: the key is stored and the machine registers when the app first connects, and
+     the tray icon turns red if the key is refused then.
    - **Anthropic API key** (optional): most people skip this; the button reads **Skip** while the box is
      empty. If you give one: it is used only for your own research questions and note replies, never for
      the fleet owner's work; everything it is used for is billed to your Anthropic account; it is stored
@@ -112,7 +114,7 @@ The name and the update choice are kept in `limits.json` as `"name"` and `"updat
 Cobalt Connector keeps up with the Cobalt server by itself:
 
 - A minute after it starts, and every 6 hours, it asks the server which version it wants
-  (`GET /api/fleet/connector?machine=<id>&version=<this version>`, with your partner key). The answer names the newest
+  (`GET /api/fleet/connector?machine=<id>&version=<this version>`, with the machine's one-hour pass). The answer names the newest
   release, the oldest one the server still sends work to, the installer's address and its SHA-256.
 - **Install automatically**: a newer version is downloaded, checked and installed. You get a notification ("A new
   version of Cobalt Connector (1.2.1) is ready. It will install itself now and start again in a minute."), the
@@ -133,15 +135,18 @@ Cobalt Connector keeps up with the Cobalt server by itself:
   cannot loop. If an update stops halfway, the installer starts the version that is still there again, and that
   version keeps its own Python, so it still works.
 - Notifications are a courtesy (Windows Focus Assist may hold them back): the window always shows the same state.
-  The app also notifies you when Cobalt refuses your partner key, stops sending this machine work, or its work
-  process keeps stopping - once per change, at most one of a kind an hour.
+  The app also notifies you when Cobalt refuses your partner key, Cobalt's owner removes this machine, Cobalt stops
+  sending it work, or its work process keeps stopping - once per change, at most one of a kind an hour.
 
 ## How it works
 
 ```
 CobaltConnector.exe (tray app)
+  ├─ signs in: POST /api/fleet/enrol once (your partner key + this machine's own public key), then
+  │            POST /api/fleet/token about every 40 minutes (signed with that key; no partner key)
+  │            -> token.json, the one-hour pass the work process uses
   ├─ python\python.exe -I bootstrap\cobalt_bootstrap.py --pull     (private embedded Python 3.12)
-  │    1. POST /api/fleet/hello            partner key in X-Cobalt-Contributor, the app's version and the
+  │    1. POST /api/fleet/hello            the pass in X-Cobalt-Device, the app's version and the
   │                                         machine's name; the answer names the code hash
   │    2. GET  /api/fleet/build/<hash>.zip  only if that build is not already here and verified
   │    3. checks it, unpacks it to %LOCALAPPDATA%\CobaltConnector\build\<hash>\
@@ -153,20 +158,26 @@ CobaltConnector.exe (tray app)
 
 - **The app** (`app/`, C++20, Win32, WinHTTP, no runtime to install) supervises one Python process. It
   starts it at below-normal priority with a minimal environment built from scratch: nothing of your own
-  environment beyond what Windows needs, so no Python setting or model key of yours leaks in. The partner
-  key is decrypted from its DPAPI file and passed through that process's environment only. The optional
+  environment beyond what Windows needs, so no Python setting or model key of yours leaks in. The app signs
+  the machine in itself (see [Your keys](#your-keys)) and gives that process only the path of `token.json`,
+  the one-hour pass it keeps fresh; the process never has your partner key. (Only on an older Cobalt server
+  that has no device sign-in yet, before this machine ever registered, is the partner key decrypted and
+  passed through that process's environment, as in 1.2.) The optional
   Anthropic key is decrypted and passed the same way only while "Run my model work on this machine" is on;
   with it off the key is not read, and the process's environment has no Anthropic key at all. The process and every process it starts run in a Windows job object that
   ends with the app, so Quit leaves nothing running. If it exits it is started again with backoff (2 s
   after a clean exit, doubling to 60 s while it keeps failing).
 - **The bootstrap** (`bootstrap/cobalt_bootstrap.py`, standard library only) says hello to the fleet with
-  your partner key. A refused key stops there: nothing is downloaded. Otherwise it downloads the build of
+  the pass. A refused key or a removed machine stops there: nothing is downloaded. A pass the server no longer
+  takes (it expired while the PC slept, say) makes it ask the app for a new one and wait a minute, without
+  restarting anything. Otherwise it downloads the build of
   the code hash the fleet runs, checks that the server labelled it with that hash, that no file in it
   points outside its folder, unpacks it into a temporary folder, recomputes the code hash from the
   unpacked files, and moves it into place only if the hash matches. It then runs that build's pull loop
   (`python -I -m src.training.contributor --pull`, with the build folder as the working directory). When
   the fleet moves to new code, the loop stops itself and the bootstrap fetches the new build the same way.
-  If the server cannot be reached and a verified build is already here, it runs that one.
+  It also fetches the build again when the server's pull loop (`loop` in the hello) differs from the one it
+  holds. If the server cannot be reached and a verified build is already here, it runs that one.
 - **Pulling, not listening**: the app asks the server for work. It opens no port on your machine and
   nothing is forwarded through your router.
 - **Checking**: a share of the jobs a machine finishes is replayed on the fleet owner's own machine and the
@@ -180,7 +191,7 @@ CobaltConnector.exe (tray app)
 | blue (ring) | idle: waiting for work, starting, or downloading the worker code |
 | green (dot) | working: jobs in flight |
 | amber (bars) | paused by you, or outside your hours |
-| red (!) | a problem: no key, key refused, offline, benched, too old to take work, or the work process keeps stopping |
+| red (!) | a problem: no key, key refused, removed by Cobalt's owner, offline, benched, too old to take work, or the work process keeps stopping |
 
 The window shows your limits (editable), the machine's name and updates, your Anthropic key, the jobs in flight,
 today's totals and the log, with Pause / Resume and "Run at logon".
@@ -208,8 +219,9 @@ In the window, under **Your Anthropic key**:
 
 ## What leaves your machine
 
-This list comes from the code, not from memory: every network call in this repository (`app/src/check_key.cpp`,
-`app/src/update.cpp`, `bootstrap/cobalt_bootstrap.py`) and in the worker code the app downloads and runs (its pull
+This list comes from the code, not from memory: every network call in this repository (`app/src/net.cpp`, which
+`app/src/token.cpp`, `app/src/check_key.cpp` and `app/src/update.cpp` send through, the GitHub download in
+`app/src/update.cpp`, and `bootstrap/cobalt_bootstrap.py`) and in the worker code the app downloads and runs (its pull
 loop, `src/training/contributor.py`, and the server routes it talks to). If you find a call that isn't listed here,
 that's a bug - please open an issue.
 
@@ -218,10 +230,16 @@ that's a bug - please open an issue.
 - **Your Anthropic key goes only to Anthropic** (`https://api.anthropic.com`), and only if you've turned on "Run my
   model work on this machine". It is never sent to Cobalt. With that option off, the work process is never given the
   key: it stays encrypted on your machine.
-- **Your partner key is sent to the Cobalt server** with every request the app makes there, always over HTTPS (the
-  app refuses a plain `http://` server address). That's how the machine signs in, the same way a password is. The server keeps only a SHA-256 hash
-  of it, and the code never logs it. No request that carries it follows a redirect: a redirect is treated as an
-  error, so the key can't be passed on to another address.
+- **Your partner key is sent to the Cobalt server once**, when Cobalt Connector first starts (or when you install
+  it): with it the app registers a key of its own that it made on this machine. That key's private half never leaves
+  your machine - it is kept in your PC's security chip (TPM) when it has one, otherwise in Windows' own key store, and
+  Windows will not let it be copied out. From then on the app signs in with that key and gets a pass that lasts one
+  hour; every request carries the pass, never your partner key. The server keeps only a SHA-256 hash of your partner
+  key and of each pass. If the server forgets this machine (for example after a reset), the app registers again by
+  itself, sending your partner key once more. If Cobalt's owner removes the machine, it stops and says so.
+- Everything goes over HTTPS (the app refuses a plain `http://` server address), with Windows' own certificate checks.
+  No request that carries your partner key or a pass follows a redirect: a redirect is treated as an error, so
+  neither can be passed on to another address. The code never logs either.
 - The Cobalt server also gets a **short description of the machine** (a random id, the computer's name, the name you
   chose, cores, memory, your limits, versions), the **results of the jobs** it runs, and, if you use model work, **the
   answers Claude wrote, with their token counts**.
@@ -241,17 +259,20 @@ that's a bug - please open an issue.
 
 ### To the Cobalt server
 
-The address is `https://api.bluesec.ai` unless you installed with `/RELAY=`. Every request below carries your
-**partner key** in the `X-Cobalt-Contributor` header, and goes over HTTPS when the address starts with `https://`
-(the app refuses any other address: a plain `http://` one would send your key in clear text. The only exception is
+The address is `https://api.bluesec.ai` unless you installed with `/RELAY=`. Apart from the two sign-in requests
+at the top of the table, every request below carries **the pass** (a one-hour token) in the `X-Cobalt-Device`
+header, and never your partner key. Everything goes over HTTPS when the address starts with `https://` (the app
+refuses any other address: a plain `http://` one would send your key in clear text. The only exception is
 `http://127.0.0.1:<port>` or `http://localhost:<port>`, this machine itself, which the tests use. An address edited
 into `contributor.json` that breaks this rule is ignored, and the default is used). None of these
 requests follows a redirect: the app, the bootstrap and the worker code all treat a redirect as an error, so the key
-goes to this address and nowhere else.
+and the pass go to this address and nowhere else. (On an older Cobalt server without device sign-in, before this
+machine first registered, every request carries the partner key in `X-Cobalt-Contributor` instead, as in 1.2.)
 
 | When | Request | What's sent | What comes back |
 |---|---|---|---|
-| The installer checks your key | `POST /api/fleet/hello` | machine id, computer name, number of cores, app version, the name you chose, "paused" | accepted or refused, the name your key belongs to, the machine's fleet id |
+| Once: the installer checks your key, or the app first starts (again only if the server forgets the machine, its key is lost, or you store a different partner key) | `POST /api/fleet/enrol` | your **partner key** in `X-Cobalt-Contributor` (the only request that carries it), the machine id, the public half of this machine's key, which key store holds it (`tpm` or `software`), the app version, the time, a random number and a signature | the machine's device id, the name your key belongs to, the first pass |
+| About every 40 minutes, on resume from sleep, and when the server stops taking the pass | `POST /api/fleet/token` | no key and no pass: the device id, the machine id, the time, a random number and a signature made with this machine's key | a new pass, valid for one hour |
 | Each time the work process starts | `POST /api/fleet/hello` | machine id, computer name, number of cores, the code hash it holds, the bootstrap's version, app version, the name you chose, "paused" | the code hash to run; whether this app is too old to get work |
 | About every 30 s between jobs (not while you're paused or outside your hours, unless model work is on) | `POST /api/fleet/hello` | machine id, computer name, cores (your limit, or all of them), total memory, free memory (capped at your limit), job slots, your hours, code hash, the loop's version, jobs running now, paused or outside your hours, the names of the market-data files it holds, and `local_model` (yes/no: model work is on here) | the code hash to run, whether the machine is benched, how many jobs are queued, the update on offer |
 | When new worker code is needed | `GET /api/fleet/build/<hash>.zip` | nothing but the request | the worker code (a zip, checked against its hash) |
@@ -259,6 +280,7 @@ goes to this address and nowhere else.
 | Asking for work | `POST /api/fleet/claim` | machine id, code hash, free job slots, free memory, and the kinds of job it takes (only when model work is on) | a job, or nothing |
 | After every job | `POST /api/fleet/result` | machine id, job number, seconds it took, and either the result or the error message (cut at 2,000 characters; see the caveat above) | stored, or refused |
 | A minute after the app starts, then every 6 hours (less often after a failure), and again right before it downloads an update | `GET /api/fleet/connector?machine=<id>&version=<app version>` | machine id, app version | the newest release, the oldest one still given work, the installer's address and SHA-256 |
+| When you uninstall | `POST /api/fleet/device/retire` | nothing but the request (and the pass) | the machine's sign-in is retired |
 
 - **The machine id** is `cc-` and 12 random hex digits, made once at install. Nothing of the computer's name is in it.
   A machine first installed as Cobalt Worker keeps its older id, which starts with the computer's name.
@@ -284,6 +306,10 @@ goes to this address and nowhere else.
   your research topic, your Ask about Cobalt question), exactly as if Cobalt had written it, and what it cost at list
   prices, on your own spend record. A failed model job's error is shown there instead.
 - Your partner key as a SHA-256 hash, and when it was last used.
+- One row per installation of the app (a "device"): its device id, your name on the key, the machine id, the public
+  half of its key, which key store holds it, the app version, when it registered and was last used, and whether and
+  why it was removed. Each pass only as a SHA-256 hash, deleted when it runs out; the random numbers of signed
+  requests for ten minutes, so a copied request can't be replayed.
 - Your IP address isn't stored by any of this code. Like any website, the server and its host can see it, and their
   ordinary access logs may record it.
 
@@ -334,16 +360,23 @@ Cobalt server and, with model work on, to Anthropic, and nowhere else.
   its environment, and only while "Run my model work on this machine" is on. With the option off the app doesn't
   decrypt it and the work process never has it. It is sent only to Anthropic, over HTTPS, in the `x-api-key` header, and only for your own model
   work. It is never sent to Cobalt.
-- **Your partner key is sent to the Cobalt server**, in the `X-Cobalt-Contributor` header of every request listed
-  above (always over HTTPS): the installer's check, each hello, each job request and result, each
-  download from the server, and the update check. It has to be: it's how the machine signs in. None of those requests
-  follows a redirect, so it can't be forwarded to another address. The server stores only
-  its SHA-256 hash and the code never logs it. It is never sent to GitHub or Anthropic. On disk it's kept only
-  encrypted, apart from the moment the installer hands it to the app (a plain file in Setup's own temp folder,
-  deleted once read), and it's never logged on your machine unless you put it on the installer's command line and
-  use `/LOG`.
-- In short: two keys, two destinations. The partner key goes to the Cobalt server and the Anthropic key goes to
-  Anthropic. Neither goes anywhere else, and no other key is ever sent.
+- **Your partner key is sent to the Cobalt server once**, in the `X-Cobalt-Contributor` header of
+  `POST /api/fleet/enrol` (always over HTTPS), when the machine registers: at install, or at the app's first start.
+  It is sent again only if the server forgets the machine, the machine's own key is lost (say the TPM was cleared),
+  you store a different partner key, or Cobalt's owner removed the machine and then allowed it back. The work process
+  never has it. The server stores only its SHA-256 hash and the code never logs it. It is never sent to GitHub or
+  Anthropic. On disk it's kept only encrypted, apart from the moment the installer hands it to the app (a plain file in
+  Setup's own temp folder, deleted once read), and it's never logged on your machine unless you put it on the
+  installer's command line and use `/LOG`.
+- **This machine's own key** is an ECDSA P-256 key that the app makes once, for your Windows user: in your PC's
+  security chip (TPM) when it has one, otherwise in Windows' software key store. Windows makes it so that it can't be
+  copied out, and nothing ever prompts you. Only its public half is sent (at registration). It signs a short request
+  for each new pass.
+- **The pass** (`X-Cobalt-Device`) lasts one hour and opens only the machine's own fleet requests: it can't sign in to
+  Cobalt's website, and it can't act for another of your machines. The app keeps it in `token.json`, which only your
+  Windows user can read, and the work process reads it from there.
+- In short: your partner key goes to the Cobalt server once, a one-hour pass goes with every other request there,
+  and the Anthropic key goes to Anthropic. None goes anywhere else, and no other key is ever sent.
 
 ## What it downloads and stores
 
@@ -362,7 +395,8 @@ question, built by the Cobalt server from what you can already see there.
 | `%LOCALAPPDATA%\Programs\Cobalt Connector\CobaltConnector.exe` | the app |
 | `...\python\` | a private Python 3.12 (python.org's embeddable build) and the worker's third-party libraries (`requirements.txt`, public PyPI packages) - never on PATH |
 | `...\bootstrap\cobalt_bootstrap.py` | the bootstrap |
-| `%LOCALAPPDATA%\CobaltConnector\` | `limits.json` (your limits, Pause, `local_model`: the model-work option, `name`: the machine's name, `updates`: `auto` or `ask`), `contributor.json` (the machine's id and the server address), `partner.key` and `anthropic.key` (DPAPI-encrypted), `status.json`, `update_state.json` (the update in progress, the back-off and releases that failed), `updates\` (a downloaded installer, deleted once it is installed), `build\<hash>\` (the downloaded worker code), `cache\` (market data), `logs\` |
+| `%LOCALAPPDATA%\CobaltConnector\` | `limits.json` (your limits, Pause, `local_model`: the model-work option, `name`: the machine's name, `updates`: `auto` or `ask`), `contributor.json` (the machine's id, the server address, and its `device`: the device id, the key's name, which key store holds it - no secret), `partner.key` and `anthropic.key` (DPAPI-encrypted), `token.json` (the current one-hour pass; only your Windows user can read it), `status.json`, `update_state.json` (the update in progress, the back-off and releases that failed), `updates\` (a downloaded installer, deleted once it is installed), `build\<hash>\` (the downloaded worker code), `cache\` (market data), `logs\` |
+| Windows' key store, for your user | the machine's own key, `CobaltConnector-device-<machine id>`: in the TPM (Microsoft Platform Crypto Provider) or the software key store (Microsoft Software Key Storage Provider) |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\CobaltConnector` | only when "Run at logon" is on |
 
 ## Your keys
@@ -376,10 +410,14 @@ question, built by the Cobalt server from what you can already see there.
   text of a question or an answer.
 - The window's **Save key** and **Clear key** change or remove the Anthropic key later; it is stored the same way.
 - An update never touches the keys.
-- The partner key is sent only to the fleet server (with every request, always over HTTPS: it's
-  how the machine signs in);
-  an Anthropic key is sent only to Anthropic. See [Keys](#keys).
-- The fleet's owner can revoke a partner key at any time, which ends the machine's access at once.
+- The partner key is sent only to the fleet server, and only once: when this machine registers, at install or at
+  the app's first start. From then on the machine signs in with a key of its own, which never leaves it (in the TPM
+  when the PC has one, otherwise in Windows' key store; Windows won't let it be copied out), and every request
+  carries a pass that lasts one hour. An Anthropic key is sent only to Anthropic. See [Keys](#keys).
+- You don't have to do anything for this: there is no prompt, and a pass that runs out (after sleep, say) is renewed
+  by itself. If the server forgets the machine, the app registers again by itself.
+- The fleet's owner can remove one machine, which stops it at once: the app says so and waits until the owner allows
+  it again, then starts by itself. Revoking your partner key ends every one of your machines' access at once.
 
 ## Uninstall
 
@@ -389,20 +427,26 @@ Windows Settings > Apps > Cobalt Connector > Uninstall, or silently:
 & "$env:LOCALAPPDATA\Programs\Cobalt Connector\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES
 ```
 
-It stops the app and its work process and removes the app folder, the private Python, the downloaded worker code,
-the cached market data, the logs, both keys, the settings and the "Run at logon" entry. Nothing is left in
-`%LOCALAPPDATA%\CobaltConnector` (or an old `%LOCALAPPDATA%\CobaltWorker`) or the registry.
+It stops the app and its work process, retires the machine's sign-in on the Cobalt server (if it can reach it within
+5 seconds; otherwise the server retires it after 90 days unused), deletes the machine's own key from Windows' key
+store, and removes the app folder, the private Python, the downloaded worker code, the cached market data, the logs,
+both keys, the pass, the settings and the "Run at logon" entry. Nothing is left in `%LOCALAPPDATA%\CobaltConnector`
+(or an old `%LOCALAPPDATA%\CobaltWorker`) or the registry.
 
 ## Command line
 
 ```
 CobaltConnector.exe [--background]                  the tray app (with its window, or tray only)
-CobaltConnector.exe --check-key <key> [--relay URL] check a partner key: exit 0 accepted, 1 refused, 2 could not check
+CobaltConnector.exe --check-key <key> [--relay URL] check a partner key and register this machine: exit 0 accepted,
+                                                    1 refused, 2 could not check
 CobaltConnector.exe --check-key-file <file>         the same, the key read from a file (deleted after)
 CobaltConnector.exe --set-keys <file>               store partner=/anthropic=/relay= lines with DPAPI (file wiped after)
 CobaltConnector.exe --set-limits <file>             save key=value lines into limits.json (?key= only when not set yet)
 CobaltConnector.exe --run-at-logon on|off
 CobaltConnector.exe --quit                          stop the running app and its work process
+CobaltConnector.exe --retire                        retire this machine's sign-in and delete its key (the uninstaller)
+CobaltConnector.exe --self-test-devkey              check that Windows can make, use and delete a device key
+CobaltConnector.exe --sign-test-vector <file>       write signed test vectors (throwaway keys) for the server's tests
 CobaltConnector.exe --version
 ```
 
@@ -425,6 +469,8 @@ powershell -ExecutionPolicy Bypass -File build.ps1 [-Clean] [-SkipInstaller] [-V
 ```
 
 It builds `CobaltConnector.exe` (CMake + Ninja, Release, `/W4 /WX`, static CRT: any warning fails the build),
+runs its device key self-test (`--self-test-devkey`: throwaway keys in the software key store and, when there is
+one, the TPM sign, are checked with their public half alone and are deleted again; a failure fails the build),
 downloads the Python 3.12 embeddable zip from python.org, installs `requirements.txt` into it (wheels only),
 stages the bootstrap and checks it and the libraries with the staged Python, and compiles `setup.iss` into
 `dist\CobaltConnectorSetup.exe` (about 85 MB), printing its SHA-256. Everything downloaded or built goes to

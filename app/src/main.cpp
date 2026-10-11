@@ -1,9 +1,15 @@
 // What leaves your machine (full list, from the code: README.md, section "What leaves your machine"):
-// - To the Cobalt server (always HTTPS; a plain-http address is refused): your partner key in X-Cobalt-Contributor on every request
-//   (how the machine signs in; the server keeps only its SHA-256), the machine id ("cc-" + 12 random hex), the
+// - To the Cobalt server (always HTTPS; a plain-http address is refused): your partner key ONCE, when the app registers
+//   this machine (POST /api/fleet/enrol, with the public half of a key the app made on this machine - its private half
+//   stays in the TPM or Windows' key store and cannot be copied out); from then on a one-hour pass in X-Cobalt-Device on
+//   every request, got by signing with that key (POST /api/fleet/token: the device id, the machine id, the time, a
+//   random number and a signature). The server keeps only SHA-256 hashes of the key and of each pass. (An older server
+//   without device keys gets the partner key on every request, as 1.2.1 did, until this machine first registers.)
+//   Also: the machine id ("cc-" + 12 random hex), the
 //   computer's name, the name you chose, cores, memory, your limits, versions, job results or error messages, and
 //   model answers with token counts. Other partners see the machine only by its label (the name you chose, or
-//   "<owner>'s machine N"), never the computer's name or the machine id. No request with the key follows a redirect.
+//   "<owner>'s machine N"), never the computer's name or the machine id. No request with a key or a pass follows a
+//   redirect.
 // - To Anthropic, only with model work on: your Anthropic key and your own question's text. Never to Cobalt. With
 //   model work off the work process is never given the key.
 // - To GitHub: a plain download request for an app update (update.cpp). No key, no id.
@@ -21,6 +27,10 @@
 //   CobaltConnector.exe --set-limits <file> [--out FILE]   merge key=value lines into limits.json (?key= only if unset)
 //   CobaltConnector.exe --run-at-logon on|off
 //   CobaltConnector.exe --quit                   stop a running instance (and the loop it supervises)
+//   CobaltConnector.exe --retire [--out FILE]    the uninstaller: this machine's sign-in is retired on the server and
+//                                                its device key deleted (exit 0 always: best effort)
+//   CobaltConnector.exe --self-test-devkey [--out FILE]   a throwaway key signs and is checked, then deleted (build.ps1)
+//   CobaltConnector.exe --sign-test-vector FILE  signed test vectors for the server's tests (throwaway keys, deleted)
 //   CobaltConnector.exe --version
 #include "app.hpp"
 
@@ -96,7 +106,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             L"  --set-keys <file>       store partner=/anthropic=/relay= lines, encrypted for this Windows user\r\n"
             L"  --set-limits <file>     save key=value lines into your limits (?key= only when not set yet)\r\n"
             L"  --run-at-logon on|off   start at sign-in, or not\r\n"
-            L"  --quit                  stop the running app and its work");
+            L"  --quit                  stop the running app and its work\r\n"
+            L"  --retire                remove this machine's sign-in from the server and delete its key (uninstall)\r\n"
+            L"  --self-test-devkey      check that Windows can make, use and delete a device key\r\n"
+            L"  --sign-test-vector <f>  write signed test vectors (throwaway keys) for the server's tests");
         return 0;
     }
     if (has(L"--check-key") || has(L"--check-key-file")) {
@@ -140,6 +153,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         return ok ? 0 : 1;
     }
     if (has(L"--quit")) return quitRunning();
+    if (has(L"--retire")) {
+        std::wstring message;
+        int rc = cw::retireDevice(message);
+        cw::logLine(L"uninstall: " + message);
+        report(message, outFile);
+        return rc;
+    }
+    if (has(L"--self-test-devkey")) {
+        std::wstring message;
+        int rc = cw::selfTestDeviceKey(message);
+        report(message, outFile);
+        return rc;
+    }
+    if (has(L"--sign-test-vector")) {
+        std::wstring message;
+        int rc = cw::signTestVectors(option(L"--sign-test-vector"), message);
+        report(message, outFile);
+        return rc;
+    }
 
     HANDLE mutex = CreateMutexW(nullptr, TRUE, cw::kMutexName);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {

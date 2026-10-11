@@ -1,7 +1,9 @@
 // Keeping the app up to date with the Cobalt server.
 //
 // Every few hours the window asks the server which version of Cobalt Connector it wants:
-//     GET <relay>/api/fleet/connector?machine=<id>&version=<this version>   (partner key in X-Cobalt-Contributor)
+//     GET <relay>/api/fleet/connector?machine=<id>&version=<this version>
+// with the machine's pass in X-Cobalt-Device (token.cpp; the partner key only on an older server without device
+// keys), never following a redirect (net.cpp).
 // The answer names the newest release, the oldest one the server still sends work to, the installer's
 // address on GitHub and its SHA-256. A newer installer is downloaded only from the Cobalt Connector releases
 // on GitHub (every redirect is checked by hand and must stay on GitHub's own download hosts), at most 300 MB,
@@ -222,62 +224,22 @@ bool validOffer(const UpdateOffer& o) {
 
 // Asks the server what it wants. UpToDate here means "an offer came back" (the caller compares versions).
 UpdateOutcome askServer(UpdateOffer& offer, bool& serverRequired, std::wstring& message) {
-    std::optional<std::string> key = loadSecret(L"partner");
-    if (!key) {
-        message = L"no partner key is stored, so no update check was made";
-        return UpdateOutcome::NoInfo;
+    std::wstring headers;
+    if (!fleetCredential(headers)) {
+        message = L"this machine is not signed in to the Cobalt server yet, so no update check was made";
+        return UpdateOutcome::Failed;
     }
+    headers += L"Accept: application/json\r\n";
     std::string relay = relayUrl();
     std::string url = relay + "/api/fleet/connector?machine=" + percentEncode(machineId()) +
                       "&version=" COBALT_CONNECTOR_VERSION;
-    Url u;
-    if (!crack(widen(url), u)) {
-        SecureZeroMemory(key->data(), key->size());
-        message = L"the server address " + widen(relay) + L" is not a web address";
+    ServerReply r;
+    if (!serverRequest(url, L"GET", headers, "", r, 30000)) {     // wipes `headers`
+        message = L"the Cobalt server could not be reached for the update check (" + r.error + L")";
         return UpdateOutcome::Failed;
     }
-    Handle session(WinHttpOpen(kUserAgent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
-                               WINHTTP_NO_PROXY_BYPASS, 0));
-    if (!session) {
-        SecureZeroMemory(key->data(), key->size());
-        message = L"the network could not be opened (error " + std::to_wstring(GetLastError()) + L")";
-        return UpdateOutcome::Failed;
-    }
-    WinHttpSetTimeouts(session.h, 10000, 15000, 20000, 30000);
-    Handle conn(WinHttpConnect(session.h, u.host.c_str(), u.port, 0));
-    Handle req(conn ? WinHttpOpenRequest(conn.h, L"GET", u.path.c_str(), nullptr, WINHTTP_NO_REFERER,
-                                         WINHTTP_DEFAULT_ACCEPT_TYPES, u.https ? WINHTTP_FLAG_SECURE : 0)
-                    : nullptr);
-    bool noRedirect = false;         // it carries the partner key: never follow a redirect (a 3xx is a failure below)
-    if (req) {
-        DWORD noRedirects = WINHTTP_DISABLE_REDIRECTS;
-        noRedirect = WinHttpSetOption(req.h, WINHTTP_OPTION_DISABLE_FEATURE, &noRedirects, sizeof noRedirects) != FALSE;
-    }
-    if (req && !noRedirect) {        // redirects could not be turned off: the key is not sent at all
-        SecureZeroMemory(key->data(), key->size());
-        message = L"the update check could not turn off redirects (error " + std::to_wstring(GetLastError()) + L")";
-        return UpdateOutcome::Failed;
-    }
-    std::wstring headers = L"X-Cobalt-Contributor: " + widen(*key) + L"\r\nAccept: application/json\r\n";
-    SecureZeroMemory(key->data(), key->size());
-    BOOL sent = req && WinHttpSendRequest(req.h, headers.c_str(), static_cast<DWORD>(headers.size()),
-                                          WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
-    SecureZeroMemory(headers.data(), headers.size() * sizeof(wchar_t));
-    if (!sent || !WinHttpReceiveResponse(req.h, nullptr)) {
-        message = L"the Cobalt server could not be reached for the update check (error " +
-                  std::to_wstring(GetLastError()) + L")";
-        return UpdateOutcome::Failed;
-    }
-    DWORD status = statusOf(req.h);
-    std::string reply;
-    for (;;) {
-        DWORD avail = 0;
-        if (!WinHttpQueryDataAvailable(req.h, &avail) || avail == 0 || reply.size() > 65536) break;
-        std::vector<char> buf(avail);
-        DWORD got = 0;
-        if (!WinHttpReadData(req.h, buf.data(), avail, &got) || got == 0) break;
-        reply.append(buf.data(), got);
-    }
+    DWORD status = r.status;
+    const std::string& reply = r.body;
     if (status == 404) {
         message = L"the Cobalt server does not offer updates yet";
         return UpdateOutcome::NoInfo;

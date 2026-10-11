@@ -2,7 +2,11 @@
 //     <install>\python\python.exe -I -X utf8 <install>\bootstrap\cobalt_bootstrap.py --pull
 // in %LOCALAPPDATA%\CobaltConnector with a minimal environment built here - nothing inherited from the user's own
 // environment beyond what Windows itself needs, so no model key or Python setting of theirs leaks in.
-// The partner key is read from its DPAPI file and passed through the child's environment only. The Anthropic key
+// Signed in with the machine's device key (token.cpp), the child gets COBALT_TOKEN_FILE (token.json, the one-hour pass
+// the app keeps fresh) and never the partner key. Only on an older server with no device keys, before this machine
+// ever enrolled, is the partner key read from its DPAPI file and passed through the child's environment, as in 1.2.1.
+// When the sign-in changes between the two, or the machine is removed, the child is stopped and started again (or
+// left stopped, with the reason shown). The Anthropic key
 // is read and passed (as ANTHROPIC_API_KEY, with COBALT_LOCAL_MODEL=1) only when the owner chose "Run my model work
 // on this machine" and a key is stored; with that option off the key is not even read, and the child's environment
 // has no ANTHROPIC_API_KEY at all (it is built from scratch below, never inherited). The key itself goes to
@@ -36,7 +40,8 @@ const wchar_t* const kPassThrough[] = {
 
 // `anthropic` is set only when the owner chose model work on this machine (Supervisor::start); the check here is the
 // second guard, so the key never reaches the child with the option off.
-std::vector<wchar_t> buildEnvironment(const std::string& partner, const std::optional<std::string>& anthropic,
+// `partner` is set only on an older server (SignIn::Legacy); otherwise the child gets the token file instead.
+std::vector<wchar_t> buildEnvironment(const std::optional<std::string>& partner, const std::optional<std::string>& anthropic,
                                       bool localModel) {
     std::vector<std::pair<std::wstring, std::wstring>> vars;
     for (const wchar_t* name : kPassThrough) {
@@ -49,7 +54,8 @@ std::vector<wchar_t> buildEnvironment(const std::string& partner, const std::opt
     vars.emplace_back(L"PATH", py + L";" + sysroot + L"\\System32;" + sysroot);
     vars.emplace_back(L"COBALT_CONTRIB_HOME", homeDir());
     vars.emplace_back(L"COBALT_FLEET_URL", widen(relayUrl()));
-    vars.emplace_back(L"COBALT_CONTRIB_KEY", widen(partner));
+    if (partner) vars.emplace_back(L"COBALT_CONTRIB_KEY", widen(*partner));
+    else vars.emplace_back(L"COBALT_TOKEN_FILE", tokenFilePath());
     if (anthropic && localModel) {
         vars.emplace_back(L"ANTHROPIC_API_KEY", widen(*anthropic));
         vars.emplace_back(L"COBALT_LOCAL_MODEL", L"1");
@@ -116,10 +122,24 @@ bool Supervisor::start() {
         problem_ = L"The bootstrap is missing (" + bootstrapScript() + L"): reinstall Cobalt Connector.";
         return false;
     }
-    std::optional<std::string> partner = loadSecret(L"partner");
-    if (!partner) {
-        problem_ = L"No partner key is stored. Run the Cobalt Connector installer again and enter your partner key.";
+    SignInState signIn = signInState();
+    waitingForSignIn_ = false;
+    if (signIn.mode == SignIn::Blocked) {
+        problem_ = signIn.problem;
         return false;
+    }
+    if (signIn.mode == SignIn::Waiting) {      // the first sign-in is in flight: look again in a second
+        problem_.clear();
+        waitingForSignIn_ = true;
+        return false;
+    }
+    std::optional<std::string> partner;        // only for an older server; never once the machine has a device key
+    if (signIn.mode == SignIn::Legacy) {
+        partner = loadSecret(L"partner");
+        if (!partner) {
+            problem_ = L"No partner key is stored. Run the Cobalt Connector installer again and enter your partner key.";
+            return false;
+        }
     }
     // the Anthropic key is read only for model work on this machine: with the option off it stays in its DPAPI file
     const bool localModel = localModelChosen();
@@ -127,8 +147,8 @@ bool Supervisor::start() {
     machineId();
     problem_.clear();
 
-    std::vector<wchar_t> env = buildEnvironment(*partner, anthropic, localModel);
-    SecureZeroMemory(partner->data(), partner->size());
+    std::vector<wchar_t> env = buildEnvironment(partner, anthropic, localModel);
+    if (partner) SecureZeroMemory(partner->data(), partner->size());
     if (anthropic) SecureZeroMemory(anthropic->data(), anthropic->size());
 
     HANDLE log = openChildLog();
@@ -170,7 +190,9 @@ bool Supervisor::start() {
     CloseHandle(pi.hThread);
     process_ = pi.hProcess;
     startedAt_ = GetTickCount64();
+    signInGeneration_ = signIn.generation;
     logLine(L"pull loop started (pid " + std::to_wstring(pi.dwProcessId) + L")" +
+            (partner ? L", signed in with the partner key (older server)" : L", signed in with the device pass") +
             (anthropic && localModel ? L", model work on this machine" : L""));
     return true;
 }
@@ -178,6 +200,16 @@ bool Supervisor::start() {
 void Supervisor::tick() {
     ULONGLONG now = GetTickCount64();
     if (process_) {
+        SignInState signIn = signInState();
+        if (signIn.generation != signInGeneration_) {
+            // the device key replaced the partner key (or the other way), or the machine was removed
+            logLine(L"the sign-in changed: the work process is stopped, and started again if this machine may run");
+            stop();
+            failures_ = 0;
+            nextStart_ = 0;
+            if (!start() && !waitingForSignIn_) nextStart_ = now + 30000;
+            return;
+        }
         if (WaitForSingleObject(process_, 0) != WAIT_OBJECT_0) return;
         DWORD code = 0;
         GetExitCodeProcess(process_, &code);
@@ -200,6 +232,11 @@ void Supervisor::tick() {
     }
     if (now < nextStart_) return;
     if (!start()) {
+        if (waitingForSignIn_) return;                // the sign-in decides within seconds: no failure counted
+        if (signInState().mode == SignIn::Blocked) {  // removed or refused: shown, and looked at again every second
+            nextStart_ = now + 1000;
+            return;
+        }
         ++failures_;
         nextStart_ = now + 30000;                     // a missing key or file: look again, quietly
     }

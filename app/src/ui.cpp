@@ -241,6 +241,9 @@ void readStatus() {
             state = TrayState::Error;
             headline = L"Stopped";
             detail = L"Its work process exited unexpectedly; see the log." + in;
+        } else if (signInState().mode == SignIn::Waiting) {
+            headline = L"Starting";
+            detail = L"Signing this machine in to the Cobalt server.";
         } else {
             headline = L"Starting";
             detail = L"Starting up." + in;
@@ -364,13 +367,17 @@ void readStatus() {
 
     // a notification when something needs the owner, once per change
     std::string notice;
-    if (fresh && s == "refused") notice = "refused";
+    SignInState signIn = signInState();
+    if (signIn.mode == SignIn::Blocked) notice = "signin:" + narrow(signIn.problem);
+    else if (fresh && s == "refused") notice = "refused";
     else if (fresh && s == "benched") notice = "benched";
     else if (fresh && s == "outdated") notice = "outdated";
     else if (!g.sup.running() && g.sup.problem().empty() && g.sup.failures() >= 3) notice = "stopped";
     if (notice != g.noticeState) {
         g.noticeState = notice;
-        if (notice == "refused") {
+        if (notice.rfind("signin:", 0) == 0) {
+            trayNotify(Notice::KeyRefused, signIn.problem, Click::Open);
+        } else if (notice == "refused") {
             trayNotify(Notice::KeyRefused, L"Cobalt did not accept your partner key. Run the Cobalt Connector installer "
                                            L"again and enter a new key.", Click::Open);
         } else if (notice == "benched") {
@@ -949,7 +956,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_TIMER:
-        if (wp == TIMER_SUPERVISE) { if (!g.installing) g.sup.tick(); }
+        if (wp == TIMER_SUPERVISE) { signInTick(); if (!g.installing) g.sup.tick(); }
         else if (wp == TIMER_STATUS) refresh();
         else if (wp == TIMER_UPDATE) updateTick();
         else if (wp == TIMER_QUIT) { KillTimer(hwnd, TIMER_QUIT); quitForUpdate(); }
@@ -988,9 +995,12 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_SHOW: showWindow(); return 0;
     case WM_APP_QUIT: DestroyWindow(hwnd); return 0;
     case WM_CLOSE: ShowWindow(hwnd, SW_HIDE); return 0;
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMRESUMEAUTOMATIC) wakeSignIn();     // the pass may have run out while asleep
+        return TRUE;
     case WM_QUERYENDSESSION: return TRUE;
     case WM_ENDSESSION:
-        if (wp) { g.sup.stop(); trayRemove(); }
+        if (wp) { g.sup.stop(); stopSignIn(); trayRemove(); }
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_SUPERVISE);
@@ -1001,6 +1011,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         for (int i = 0; i < 30 && updateThreadBusy(); ++i) Sleep(100);   // let a download stop cleanly
         trayRemove();
         g.sup.stop();
+        stopSignIn();
         logLine(L"app stopped");
         PostQuitMessage(0);
         return 0;
@@ -1053,6 +1064,7 @@ int runApp(HINSTANCE inst, bool show) {
         if (st.num("failures") > 0) next = std::max(next, static_cast<time_t>(st.num("next_check")));
         g.nextUpdateCheck = next;
     }
+    startSignIn();
     g.sup.tick();
     SetTimer(hwnd, TIMER_SUPERVISE, 1000, nullptr);
     SetTimer(hwnd, TIMER_STATUS, 2000, nullptr);

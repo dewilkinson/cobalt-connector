@@ -4,7 +4,7 @@
 # The version is written HERE only. CMake turns it into version.h (for the code and for app.rc), and
 # build.ps1 reads it from this line to pass to the installer.
 cmake_minimum_required(VERSION 3.21)
-project(CobaltConnector VERSION 1.2.1 LANGUAGES CXX RC)
+project(CobaltConnector VERSION 1.3.0 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,6 +21,9 @@ add_executable(CobaltConnector WIN32
   src/util.cpp
   src/keys.cpp
   src/check_key.cpp
+  src/net.cpp
+  src/devkey.cpp
+  src/token.cpp
   src/migrate.cpp
   src/supervisor.cpp
   src/update.cpp
@@ -34,4 +37,4 @@ target_compile_definitions(CobaltConnector PRIVATE
 target_compile_options(CobaltConnector PRIVATE /W4 /WX /permissive- /utf-8 /EHsc /Zc:__cplusplus)
 target_link_options(CobaltConnector PRIVATE /MANIFEST:NO)
 target_link_libraries(CobaltConnector PRIVATE
-  winhttp crypt32 shell32 comctl32 advapi32 user32 gdi32 ole32 bcrypt shlwapi)
+  winhttp crypt32 shell32 comctl32 advapi32 user32 gdi32 ole32 bcrypt ncrypt shlwapi)

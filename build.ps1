@@ -83,6 +83,13 @@ Say "warnings: $($warnings.Count)"
 if ($warnings.Count) { throw "the build has warnings (it must build clean at /W4)" }
 $exe = Join-Path $build "CobaltConnector.exe"
 
+Say "device key self-test (throwaway keys in the software store and the TPM sign, BCrypt verifies, the keys are deleted)"
+$selfTestOut = Join-Path $build "self-test-devkey.txt"
+if (Test-Path $selfTestOut) { Remove-Item -Force $selfTestOut }
+$p = Start-Process -FilePath $exe -ArgumentList @("--self-test-devkey", "--out", "`"$selfTestOut`"") -Wait -PassThru -WindowStyle Hidden
+if (Test-Path $selfTestOut) { Get-Content $selfTestOut | Out-Host }
+if ($p.ExitCode -ne 0) { throw "the device key self-test failed" }
+
 # ------------------------------------------------------------------ 2. the embedded Python
 $pyZip = Join-Path $cache "python-$PythonVersion-embed-amd64.zip"
 if (-not (Test-Path $pyZip)) {

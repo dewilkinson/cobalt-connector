@@ -266,6 +266,8 @@ std::string relayUrl() {
 }
 
 std::string machineId() {
+    static std::mutex m;               // the window's thread and the sign-in thread may both ask first
+    std::lock_guard<std::mutex> lock(m);
     std::wstring path = homeFile(L"contributor.json");
     Json cfg = readJsonFile(path);
     std::string id = cfg.str("machine");
