@@ -152,7 +152,12 @@ struct DeviceKey {
 };
 std::string base64url(const std::string& bytes);                    // without padding
 std::string randomNonce();                                          // 16 random bytes, base64url
-bool openDeviceKey(const std::string& machine, const std::string& provider, DeviceKey& out, std::wstring& err);
+// What opening the device key found. Missing: the key store itself answered that no such key exists (NTE_BAD_KEYSET:
+// a cleared TPM, a deleted key) - only then may a new key be made. Unavailable: anything else (the TPM not ready at
+// logon or after resume, a dictionary-attack lockout, its service not running): the key, the device record and the
+// pass are all kept, and the app tries again later.
+enum class KeyState { Ok, Missing, Unavailable };
+KeyState openDeviceKey(const std::string& machine, const std::string& provider, DeviceKey& out, std::wstring& err);
 bool createDeviceKey(const std::string& machine, DeviceKey& out, std::wstring& err);   // replaces one of that name
 bool signWithDeviceKey(const DeviceKey& k, const std::string& text, std::string& sigB64u, std::wstring& err);
 bool deleteDeviceKey(const std::string& machine);

@@ -97,17 +97,27 @@ bool signHash(NCRYPT_KEY_HANDLE key, const std::string& text, std::string& sig, 
     return true;
 }
 
-bool openIn(const std::string& provider, const std::wstring& name, Key& key) {
+// Missing only when the provider opened and answered NTE_BAD_KEYSET for the key; any other failure (the provider not
+// opening, the TPM not ready or locked out) is Unavailable, never taken for a lost key. `why` gets the status.
+KeyState openIn(const std::string& provider, const std::wstring& name, Key& key, SECURITY_STATUS* why = nullptr) {
     Prov prov;
-    if (NCryptOpenStorageProvider(&prov.h, providerName(provider), 0) != ERROR_SUCCESS) return false;
-    return NCryptOpenKey(prov.h, &key.h, name.c_str(), 0, NCRYPT_SILENT_FLAG) == ERROR_SUCCESS;
+    SECURITY_STATUS s = NCryptOpenStorageProvider(&prov.h, providerName(provider), 0);
+    if (s != ERROR_SUCCESS) {
+        if (why) *why = s;
+        return KeyState::Unavailable;
+    }
+    s = NCryptOpenKey(prov.h, &key.h, name.c_str(), 0, NCRYPT_SILENT_FLAG);
+    if (why) *why = s;
+    if (s == ERROR_SUCCESS) return KeyState::Ok;
+    key.h = 0;
+    return s == NTE_BAD_KEYSET ? KeyState::Missing : KeyState::Unavailable;
 }
 
 // Flags 0, not NCRYPT_SILENT_FLAG: the TPM's provider refuses that flag on a delete (NTE_BAD_FLAGS) and keeps the key.
 // Nothing can prompt here anyway: these keys have no UI protection policy.
 bool deleteIn(const std::string& provider, const std::wstring& name) {
     Key key;
-    if (!openIn(provider, name, key)) return false;
+    if (openIn(provider, name, key) != KeyState::Ok) return false;
     if (NCryptDeleteKey(key.h, 0) != ERROR_SUCCESS) return false;
     key.h = 0;                            // NCryptDeleteKey frees the handle when it succeeds
     return true;
@@ -204,21 +214,34 @@ std::string randomNonce() {
     return s;
 }
 
-bool openDeviceKey(const std::string& machine, const std::string& provider, DeviceKey& out, std::wstring& err) {
+// The key is looked for in the store it was made in, then the other; whether it is lost is decided by the store it was
+// made in alone.
+KeyState openDeviceKey(const std::string& machine, const std::string& provider, DeviceKey& out, std::wstring& err) {
     std::wstring name = keyName(machine);
-    for (const std::string& p : {provider, std::string(provider == "tpm" ? "software" : "tpm")}) {
-        if (p != "tpm" && p != "software") continue;
+    const std::string mine = provider == "software" ? "software" : "tpm";
+    const std::string other = mine == "tpm" ? "software" : "tpm";
+    KeyState first = KeyState::Unavailable;
+    SECURITY_STATUS why = 0;
+    for (const std::string& p : {mine, other}) {
         Key key;
-        if (!openIn(p, name, key)) continue;
+        SECURITY_STATUS s = 0;
+        KeyState st = openIn(p, name, key, &s);
+        if (p == mine) { first = st; why = s; }
+        if (st != KeyState::Ok) continue;
         std::string raw;
-        if (!exportPublic(key.h, raw, err)) return false;
+        if (!exportPublic(key.h, raw, err)) return KeyState::Unavailable;
         out.machine = machine;
         out.provider = p;
         out.publicKey = base64url(raw);
-        return true;
+        return KeyState::Ok;
     }
-    err = L"this machine's device key is not in Windows' key store";
-    return false;
+    if (first == KeyState::Missing) {
+        err = L"this machine's device key is not in Windows' key store";
+        return KeyState::Missing;
+    }
+    err = std::wstring(mine == "tpm" ? L"the TPM" : L"Windows' software key store") +
+          L" could not open this machine's device key just now (" + hr(why) + L")";
+    return KeyState::Unavailable;
 }
 
 bool createDeviceKey(const std::string& machine, DeviceKey& out, std::wstring& err) {
@@ -246,8 +269,9 @@ bool createDeviceKey(const std::string& machine, DeviceKey& out, std::wstring& e
 
 bool signWithDeviceKey(const DeviceKey& k, const std::string& text, std::string& sigB64u, std::wstring& err) {
     Key key;
-    if (!openIn(k.provider, keyName(k.machine), key)) {
-        err = L"this machine's device key could not be opened";
+    SECURITY_STATUS s = 0;
+    if (openIn(k.provider, keyName(k.machine), key, &s) != KeyState::Ok) {
+        err = L"this machine's device key could not be opened (" + hr(s) + L")";
         return false;
     }
     std::string sig;
@@ -286,11 +310,14 @@ static std::wstring selfTestIn(const std::string& provider) {
     bool tamperRefused = ok && !verifyWithPublic(raw, text + "x", sig);
     bool deleted = deleteIn(provider, name);
     Key gone;
-    bool stillThere = openIn(provider, name, gone);
+    SECURITY_STATUS s = 0;
+    KeyState after = openIn(provider, name, gone, &s);
     if (!ok) return err;
     if (exportable) return L"the private key could be exported";
     if (!verified || !tamperRefused) return L"the signature did not check out";
-    if (!deleted || stillThere) return L"the throwaway key was not deleted";
+    if (!deleted || after == KeyState::Ok) return L"the throwaway key was not deleted";
+    // only this answer lets the app make a new key; anything else must read as "not available just now"
+    if (after != KeyState::Missing) return L"a deleted key was not reported missing (" + hr(s) + L")";
     return {};
 }
 
@@ -305,7 +332,7 @@ int selfTestDeviceKey(std::wstring& message) {
     message = L"device key self-test passed: in the software key store" +
               std::wstring(noTpm ? L" (no TPM key here: " + tpm + L")" : L" and in the TPM") +
               L", a non-exportable P-256 key signed, BCrypt verified the signature with the public half alone, refused "
-              L"a changed text, and the throwaway key was deleted.";
+              L"a changed text, and the throwaway key was deleted and then reported missing.";
     return 0;
 }
 

@@ -236,7 +236,12 @@ that's a bug - please open an issue.
   Windows will not let it be copied out. From then on the app signs in with that key and gets a pass that lasts one
   hour; every request carries the pass, never your partner key. The server keeps only a SHA-256 hash of your partner
   key and of each pass. If the server forgets this machine (for example after a reset), the app registers again by
-  itself, sending your partner key once more. If Cobalt's owner removes the machine, it stops and says so.
+  itself, sending your partner key once more. If Cobalt's owner removes the machine, it stops and says so; every 30
+  minutes it asks whether it is allowed back, signed with its own key and without your partner key, and registers
+  again (sending the partner key that once) only after the owner has allowed it. Until the server has accepted the
+  machine at all - your partner key refused, or already at its limit of machines - the app tries to register again
+  every 5 minutes (a refused key) or every 30 minutes (too many machines), and each of those tries carries the
+  partner key.
 - Everything goes over HTTPS (the app refuses a plain `http://` server address), with Windows' own certificate checks.
   No request that carries your partner key or a pass follows a redirect: a redirect is treated as an error, so
   neither can be passed on to another address. The code never logs either.
@@ -271,8 +276,8 @@ machine first registered, every request carries the partner key in `X-Cobalt-Con
 
 | When | Request | What's sent | What comes back |
 |---|---|---|---|
-| Once: the installer checks your key, or the app first starts (again only if the server forgets the machine, its key is lost, or you store a different partner key) | `POST /api/fleet/enrol` | your **partner key** in `X-Cobalt-Contributor` (the only request that carries it), the machine id, the public half of this machine's key, which key store holds it (`tpm` or `software`), the app version, the time, a random number and a signature | the machine's device id, the name your key belongs to, the first pass |
-| About every 40 minutes, on resume from sleep, and when the server stops taking the pass | `POST /api/fleet/token` | no key and no pass: the device id, the machine id, the time, a random number and a signature made with this machine's key | a new pass, valid for one hour |
+| Once: the installer checks your key, or the app first starts (again only if the server forgets the machine, its key is lost, you store a different partner key, or Cobalt's owner allows a removed machine back; and every 5 minutes while the key is refused, or every 30 minutes while the key has too many machines, until the server accepts the machine) | `POST /api/fleet/enrol` | your **partner key** in `X-Cobalt-Contributor` (the only request that carries it), the machine id, the public half of this machine's key, which key store holds it (`tpm` or `software`), the app version, the time, a random number and a signature | the machine's device id, the name your key belongs to, the first pass |
+| About every 40 minutes, on resume from sleep, and when the server stops taking the pass; every 30 minutes while Cobalt's owner has removed the machine (to learn when it is allowed back) | `POST /api/fleet/token` | no key and no pass: the device id, the machine id, the time, a random number and a signature made with this machine's key | a new pass, valid for one hour |
 | Each time the work process starts | `POST /api/fleet/hello` | machine id, computer name, number of cores, the code hash it holds, the bootstrap's version, app version, the name you chose, "paused" | the code hash to run; whether this app is too old to get work |
 | About every 30 s between jobs (not while you're paused or outside your hours, unless model work is on) | `POST /api/fleet/hello` | machine id, computer name, cores (your limit, or all of them), total memory, free memory (capped at your limit), job slots, your hours, code hash, the loop's version, jobs running now, paused or outside your hours, the names of the market-data files it holds, and `local_model` (yes/no: model work is on here) | the code hash to run, whether the machine is benched, how many jobs are queued, the update on offer |
 | When new worker code is needed | `GET /api/fleet/build/<hash>.zip` | nothing but the request | the worker code (a zip, checked against its hash) |
@@ -363,7 +368,12 @@ Cobalt server and, with model work on, to Anthropic, and nowhere else.
 - **Your partner key is sent to the Cobalt server once**, in the `X-Cobalt-Contributor` header of
   `POST /api/fleet/enrol` (always over HTTPS), when the machine registers: at install, or at the app's first start.
   It is sent again only if the server forgets the machine, the machine's own key is lost (say the TPM was cleared),
-  you store a different partner key, or Cobalt's owner removed the machine and then allowed it back. The work process
+  you store a different partner key, or Cobalt's owner removed the machine and then allowed it back (while it stays
+  removed, the app asks every 30 minutes with its own key, not the partner key). Before the server has accepted the
+  machine at all, each try to register carries it: every 5 minutes while the key is refused, every 30 minutes while
+  the key already has as many machines as it may. A key that Windows can't open for a moment (a TPM not ready after
+  sleep, say) is waited for, not replaced: a new key, and with it a new registration, only when Windows says the old
+  key is gone. The work process
   never has it. The server stores only its SHA-256 hash and the code never logs it. It is never sent to GitHub or
   Anthropic. On disk it's kept only encrypted, apart from the moment the installer hands it to the app (a plain file in
   Setup's own temp folder, deleted once read), and it's never logged on your machine unless you put it on the
@@ -411,7 +421,8 @@ question, built by the Cobalt server from what you can already see there.
 - The window's **Save key** and **Clear key** change or remove the Anthropic key later; it is stored the same way.
 - An update never touches the keys.
 - The partner key is sent only to the fleet server, and only once: when this machine registers, at install or at
-  the app's first start. From then on the machine signs in with a key of its own, which never leaves it (in the TPM
+  the app's first start (and again on each try while the server refuses to register the machine - see
+  [Keys](#keys)). From then on the machine signs in with a key of its own, which never leaves it (in the TPM
   when the PC has one, otherwise in Windows' key store; Windows won't let it be copied out), and every request
   carries a pass that lasts one hour. An Anthropic key is sent only to Anthropic. See [Keys](#keys).
 - You don't have to do anything for this: there is no prompt, and a pass that runs out (after sleep, say) is renewed

@@ -11,8 +11,11 @@
 //   access list that grants only this Windows user. The work process is started with COBALT_TOKEN_FILE and never
 //   with the partner key; it reads the file again whenever it changes, so a renewal never restarts it.
 // - Removed by Cobalt's owner: the app stops the work process and says so. It does not register again by itself
-//   (that would undo the removal): it asks every 30 minutes, and the server lets it back in only once the owner
-//   allows the machine again.
+//   (that would undo the removal): every 30 minutes it asks the token route, signed with its own key and without the
+//   partner key. The server answers "device_revoked" while the machine stays removed and "device_unknown" once the
+//   owner allows it again; only then does the app register again, sending the partner key that one time.
+// - The device key not opening (the TPM not ready at logon or after resume, a lockout) is waited out: the key, the
+//   device and the pass are kept. A new key is made only when Windows says the key no longer exists (a cleared TPM).
 // - An older server (no /enrol route, before this machine ever enrolled): the app runs as 1.2.1 did, with the
 //   partner key in the work process's environment, and asks again every 30 minutes. Once enrolled it never falls back.
 // Nothing here logs a key, a pass, a nonce or a signature: the log names the device, the machine and the outcome.
@@ -99,6 +102,16 @@ void saveDevice(const Json& dev) {
         cfg.set("device", Json::object());
     }
     writeJsonFile(path, cfg);
+}
+
+// The server should forget this device (it no longer knows it, the server address or the partner key changed): the
+// id goes, but the record keeps which key store holds the machine's key, so a TPM that is only slow to answer is
+// never taken for a machine without a key.
+void forgetDevice(const Json& dev) {
+    Json d = Json::object();
+    std::string provider = dev.str("provider");
+    if (!provider.empty()) d.set("provider", Json::string(provider));
+    saveDevice(d);
 }
 
 // A short tag of the partner key the device was enrolled with (12 hex of its SHA-256), so a different key stored
@@ -312,13 +325,20 @@ Outcome callToken(const std::string& relay, const std::string& device, const std
     });
 }
 
-// The machine's device key: the one already made, else a new one (TPM first).
-bool deviceKey(const std::string& machine, const Json& dev, DeviceKey& k, std::wstring& err) {
-    if (openDeviceKey(machine, dev.str("provider", "tpm"), k, err)) return true;
-    if (!createDeviceKey(machine, k, err)) return false;
+enum class Made { Ready, Wait, CannotMake };
+
+// The machine's device key: the one already made, else a new one (TPM first). A key that exists but cannot be opened
+// just now is waited for (Wait) - a new one is made only when there never was one or Windows says it is gone, so a
+// slow TPM never pushes the machine into the software key store.
+Made deviceKey(const std::string& machine, const Json& dev, DeviceKey& k, std::wstring& err) {
+    bool hadKey = !dev.str("provider").empty();
+    KeyState st = openDeviceKey(machine, dev.str("provider", "tpm"), k, err);
+    if (st == KeyState::Ok) return Made::Ready;
+    if (st == KeyState::Unavailable && hadKey) return Made::Wait;
+    if (!createDeviceKey(machine, k, err)) return Made::CannotMake;
     logLine(L"device key made for machine " + widen(machine) + L" (" +
             (k.provider == "tpm" ? L"in the TPM" : L"in Windows' software key store") + L")");
-    return true;
+    return Made::Ready;
 }
 
 // Saves what an enrol gave: the device, its first pass. True when both are in place.
@@ -348,6 +368,7 @@ public:
 
 private:
     long long enrolStep(const std::string& relay, const std::string& machine, const Json& dev);
+    long long removedStep(const std::string& relay, const std::string& machine, const Json& dev);
     long long tokenStep(const std::string& relay, const std::string& machine, const Json& dev, bool forced);
     long long backoff() {
         static const long long minutes[] = {1, 2, 4, 8, 16, 30};
@@ -368,7 +389,7 @@ long long Manager::step(bool forced) {
     bool have = !dev.str("id").empty();
     if (have && normalRelay(dev.str("relay", relay)) != normalRelay(relay)) {
         logLine(L"sign-in: the server address changed; this machine registers with the new one");
-        saveDevice(Json::object());
+        forgetDevice(dev);
         deleteTokenFile();
         have = false;
     }
@@ -379,14 +400,66 @@ long long Manager::step(bool forced) {
             SecureZeroMemory(key->data(), key->size());
             if (changed) {
                 logLine(L"sign-in: a different partner key is stored; this machine registers again with it");
-                saveDevice(Json::object());
+                forgetDevice(dev);
                 deleteTokenFile();
                 have = false;
             }
         }
     }
-    if (!have || dev.flag("revoked")) return enrolStep(relay, machine, dev);
+    if (!have) return enrolStep(relay, machine, dev);
+    if (dev.flag("revoked")) return removedStep(relay, machine, dev);
     return tokenStep(relay, machine, dev, forced);
+}
+
+// A machine Cobalt's owner removed asks the token route, signed and without the partner key, whether it is allowed
+// back: "device_revoked" while it stays removed; "device_unknown" once the owner allowed it again, and only then does
+// it register again (the one time the partner key is sent).
+long long Manager::removedStep(const std::string& relay, const std::string& machine, const Json& dev) {
+    setMode(SignIn::Blocked, kRemovedText);
+    std::string device = dev.str("id");
+    DeviceKey k;
+    std::wstring err;
+    KeyState st = openDeviceKey(machine, dev.str("provider", "tpm"), k, err);
+    if (st == KeyState::Missing) {
+        logLine(L"sign-in: " + err + L"; the removed machine can only ask by registering again");
+        forgetDevice(dev);
+        return kRemovedRetry;
+    }
+    if (st == KeyState::Unavailable) {
+        logLine(L"sign-in: " + err + L"; asking again later whether this machine is allowed back");
+        return kRemovedRetry;
+    }
+    Outcome o = callToken(relay, device, machine, k);
+    switch (o.got) {
+    case Got::DeviceRevoked:
+        return kRemovedRetry;
+    case Got::DeviceUnknown:
+        logLine(L"sign-in: device " + widen(device) + L" is no longer removed; this machine registers again");
+        forgetDevice(dev);
+        return 1;
+    case Got::Ok: {
+        std::string token = o.reply.str("token");
+        long long expires = static_cast<long long>(o.reply.num("expires"));
+        bool ok = writeTokenFile(token, expires, device, machine);
+        SecureZeroMemory(token.data(), token.size());
+        if (!ok) return backoff();
+        Json d = dev;
+        std::erase_if(d.o, [](const auto& kv) { return kv.first == "revoked"; });
+        saveDevice(d);
+        failures_ = 0;
+        logLine(L"sign-in: device " + widen(device) + L" is signed in again");
+        setMode(SignIn::Device);
+        return std::max<long long>(60, expires - kRenewBefore - serverNow());
+    }
+    case Got::KeyRevoked:
+        setMode(SignIn::Blocked, kKeyRevokedText);
+        return kRemovedRetry;
+    case Got::RateLimited:
+        return std::max<long long>(60, o.retryAfter);
+    default:
+        logLine(L"sign-in: asking whether this machine is allowed back did not work: " + o.text);
+        return kRemovedRetry;
+    }
 }
 
 long long Manager::enrolStep(const std::string& relay, const std::string& machine, const Json& dev) {
@@ -399,7 +472,15 @@ long long Manager::enrolStep(const std::string& relay, const std::string& machin
     }
     DeviceKey k;
     std::wstring err;
-    if (!deviceKey(machine, dev, k, err)) {
+    Made made = deviceKey(machine, dev, k, err);
+    if (made == Made::Wait) {
+        SecureZeroMemory(key->data(), key->size());
+        logLine(L"sign-in: " + err + L"; the key is kept and Cobalt Connector tries again");
+        setMode(SignIn::Blocked, L"Windows cannot open this machine's sign-in key just now (" + err + L"). Cobalt "
+                                 L"Connector keeps trying.");
+        return backoff();
+    }
+    if (made == Made::CannotMake) {
         SecureZeroMemory(key->data(), key->size());
         if (!everEnrolled()) {
             // Windows cannot make a key at all here: run as 1.2.1 did rather than not at all
@@ -456,8 +537,7 @@ long long Manager::enrolStep(const std::string& relay, const std::string& machin
     case Got::RateLimited:
         offlineIsDevice();
         return std::max<long long>(60, o.retryAfter);
-    case Got::KeyUnusable:
-        deleteDeviceKey(machine);           // made again on the next try
+    case Got::KeyUnusable:                  // the key opened but did not sign: kept, and tried again (never deleted)
         offlineIsDevice();
         return backoff();
     default:
@@ -477,12 +557,17 @@ long long Manager::tokenStep(const std::string& relay, const std::string& machin
     SecureZeroMemory(held.token.data(), held.token.size());
     DeviceKey k;
     std::wstring err;
-    if (!openDeviceKey(machine, dev.str("provider", "tpm"), k, err)) {
+    KeyState st = openDeviceKey(machine, dev.str("provider", "tpm"), k, err);
+    if (st == KeyState::Missing) {           // Windows says the key is gone (a cleared TPM): a new one, a new device
         logLine(L"sign-in: " + err + L"; a new key is made and the machine registers again");
-        deleteDeviceKey(machine);
-        saveDevice(Json::object());
+        forgetDevice(dev);
         deleteTokenFile();
         return 1;
+    }
+    if (st == KeyState::Unavailable) {       // not ready, locked out, its service not up: wait, keep everything
+        logLine(L"sign-in: " + err + L"; the key and the pass are kept and Cobalt Connector tries again");
+        setMode(SignIn::Device);            // the work process keeps the pass it has; it may still be good
+        return backoff();
     }
     Outcome o = callToken(relay, device, machine, k);
     switch (o.got) {
@@ -499,7 +584,7 @@ long long Manager::tokenStep(const std::string& relay, const std::string& machin
     }
     case Got::DeviceUnknown:
         logLine(L"sign-in: the server no longer knows device " + widen(device) + L" (" + o.text + L"); registering again");
-        saveDevice(Json::object());
+        forgetDevice(dev);
         deleteTokenFile();
         return 1;
     case Got::DeviceRevoked: {
@@ -516,12 +601,10 @@ long long Manager::tokenStep(const std::string& relay, const std::string& machin
         deleteTokenFile();
         setMode(SignIn::Blocked, kKeyRevokedText);
         return kRemovedRetry;
-    case Got::KeyUnusable:
-        logLine(L"sign-in: " + o.text + L"; a new key is made and the machine registers again");
-        deleteDeviceKey(machine);
-        saveDevice(Json::object());
-        deleteTokenFile();
-        return 1;
+    case Got::KeyUnusable:                  // opened but did not sign just now: kept, with the device and the pass
+        logLine(L"sign-in: " + o.text + L"; the key and the pass are kept and Cobalt Connector tries again");
+        setMode(SignIn::Device);
+        return backoff();
     case Got::RateLimited:
         logLine(L"sign-in: renewing the pass was refused for now: " + o.text);
         return std::max<long long>(60, o.retryAfter);
@@ -614,7 +697,7 @@ int enrolForKeyCheck(const std::string& key, const std::string& relay, std::wstr
     Json dev = deviceRecord();
     DeviceKey k;
     std::wstring err;
-    if (!deviceKey(machine, dev, k, err)) {
+    if (deviceKey(machine, dev, k, err) != Made::Ready) {
         logLine(L"key check: no device key could be made (" + err + L"); checking the key the old way");
         return 3;
     }
@@ -669,7 +752,7 @@ int retireDevice(std::wstring& message) {
         if (t.token.empty() || t.device != device || t.expires - serverNow() < 60) {
             DeviceKey k;
             std::wstring err;
-            if (openDeviceKey(machine, dev.str("provider", "tpm"), k, err)) {
+            if (openDeviceKey(machine, dev.str("provider", "tpm"), k, err) == KeyState::Ok) {
                 Outcome o = callToken(relay, device, machine, k);
                 if (o.got == Got::Ok) t.token = o.reply.str("token");
             }
